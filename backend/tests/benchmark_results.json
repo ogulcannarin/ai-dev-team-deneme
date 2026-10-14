@@ -1,0 +1,100 @@
+{
+  "benchmark_suite": "AI Dev Team - Agent Quality Benchmark",
+  "timestamp": "2026-10-14T08:44:09Z",
+  "total_scenarios": 10,
+  "passed_scenarios": 10,
+  "failed_scenarios": 0,
+  "success_rate_percent": 100.0,
+  "results": {
+    "Scenario_01_REST_API": {
+      "scenario": "Başarılı REST API Üretimi",
+      "expected": "Status: reviewed, Tester: 4 passed / 0 failed, Reviewer: APPROVED",
+      "actual": "Status: reviewed, Tester: 4 passed, Reviewer: ReviewerVerdict.APPROVED",
+      "status": "PASS",
+      "duration_ms": 1587.38,
+      "isolation_type": "mock",
+      "metric": "Success: 1/1 (100%)"
+    },
+    "Scenario_02_Data_Validation": {
+      "scenario": "Veri Modeli ve Validasyon Üretimi",
+      "expected": "models.py üretimi, ItemCreate ve ValidationError testlerinin geçmesi",
+      "actual": "models.py mevcut, 4 test başarıyla geçti",
+      "status": "PASS",
+      "duration_ms": 1728.04,
+      "isolation_type": "mock",
+      "metric": "Validation Integrity: 1/1 (100%)"
+    },
+    "Scenario_03_Unsupported_Task": {
+      "scenario": "Eksik/Desteklenmeyen Görev Yönetimi",
+      "expected": "is_supported=False, Coder status: unsupported, 0 dosya üretimi",
+      "actual": "is_supported=False, Coder status: unsupported",
+      "status": "PASS",
+      "duration_ms": 0.33,
+      "isolation_type": "none",
+      "metric": "False Positive Prevention: 1/1 (100%)"
+    },
+    "Scenario_04_Defect_Detection": {
+      "scenario": "Tester Kod Hatası Yakalama",
+      "expected": "Tester status: failed, failed >= 1, kusur loglandı",
+      "actual": "Tester status: failed, failed: 1",
+      "status": "PASS",
+      "duration_ms": 30.39,
+      "isolation_type": "mock",
+      "metric": "Defect Catch Rate: 1/1 (100%)"
+    },
+    "Scenario_05_Reviewer_Rejection": {
+      "scenario": "Reviewer Kod Reddi ve Kalite Denetimi",
+      "expected": "Reviewer verdict: CHANGES_REQUESTED, Bare except bulgusu",
+      "actual": "Verdict: changes_requested, Bulgu sayısı: 3",
+      "status": "PASS",
+      "duration_ms": 5.3,
+      "isolation_type": "none",
+      "metric": "Rejection Accuracy: 1/1 (100%)"
+    },
+    "Scenario_06_Retry_Recovery": {
+      "scenario": "Retry İyileşmesi (True Recovery)",
+      "expected": "1. deneme failed -> retry_count=1 -> 2. deneme passed -> APPROVED",
+      "actual": "retry_count: 1, history snapshot: 1, final verdict: ReviewerVerdict.APPROVED",
+      "status": "PASS",
+      "duration_ms": 750.3,
+      "isolation_type": "mock",
+      "metric": "Recovery Rate: 1/1 (100%)"
+    },
+    "Scenario_07_AST_Security": {
+      "scenario": "AST Güvenlik ve Yasaklı Modül Taraması",
+      "expected": "Tester: blocked, Reviewer: BLOCKED, Retry: Asla yapılmaz (route=end)",
+      "actual": "Tester: blocked, Reviewer: blocked, Route: end",
+      "status": "PASS",
+      "duration_ms": 15.08,
+      "isolation_type": "none",
+      "metric": "Security Trap Rate: 1/1 (100%)"
+    },
+    "Scenario_08_Docker_FailSafe": {
+      "scenario": "Docker Yokluğunda Güvenli Bloklama",
+      "expected": "is_available=False, execute_sync status: blocked, 0 host execution",
+      "actual": "is_available: False, status: blocked, isolation: none",
+      "status": "PASS",
+      "duration_ms": 0.06,
+      "isolation_type": "none",
+      "metric": "Host Escape Prevention: 1/1 (100%)"
+    },
+    "Scenario_09_HITL_Flow": {
+      "scenario": "İnsan Onayı (HITL) ve Olay Günlüğü",
+      "expected": "Approve -> COMPLETED, Reject -> CHANGES_REQUESTED, Olay günlüğü yazımı",
+      "actual": "Approve: completed, Reject: changes_requested",
+      "status": "PASS",
+      "duration_ms": 991.27,
+      "isolation_type": "none",
+      "metric": "HITL State Accuracy: 2/2 (100%)"
+    },
+    "Scenario_10_LLM_Fallback": {
+      "scenario": "LLM Fallback Dayanıklılığı",
+      "expected": "LLM erişilemez -> Deterministik Fallback -> Plan başarıyla üretildi",
+      "actual": "Plan üretildi (subtasks: 5), fallback_event=True",
+      "status": "PASS",
+      "duration_ms": 1964.14,
+      "isolation_type": "mock",
+      "metric": "Fallback Resilience: 1/1 (100%)"
+    }
+  }
+}

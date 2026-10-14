@@ -1,0 +1,38 @@
+# backend/docker/Dockerfile.runner
+# AI Dev Team - Güvenli Test Yürütücü Sandbox İmajı
+#
+# Güvenlik Kısıtları:
+# 1. Rootless (Ayrıcalıksız 'runner' kullanıcısı, UID=1000)
+# 2. Önceden yüklenmiş paketler (Çalışma anında ağ indirmesi yapılmaz)
+# 3. Salt okunur kök dosya sistemiyle çalışmaya uygun yapı
+# 4. Giriş noktası python/unittest
+
+FROM python:3.10-slim
+
+# Güvenlik ortam değişkenleri
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Gerekli minimum test ve web framework bağımlılıklarını kur
+RUN pip install --no-cache-dir \
+    pydantic==2.10.6 \
+    fastapi==0.115.8 \
+    starlette==0.45.3 \
+    httpx==0.28.1 \
+    pytest==9.0.3
+
+# Ayrıcalıksız 'runner' kullanıcısı oluştur
+RUN groupadd -g 1000 runner && \
+    useradd -u 1000 -g runner -m -s /bin/bash runner
+
+# İzole çalışma dizini oluştur ve izinleri ayarla
+WORKDIR /workspace
+RUN chown -R runner:runner /workspace
+
+# Ayrıcalıksız kullanıcıya geç
+USER runner:runner
+
+# Varsayılan test komutu
+CMD ["python", "-m", "unittest", "-v", "test_feature.py"]

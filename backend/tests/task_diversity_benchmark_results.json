@@ -1,0 +1,189 @@
+{
+  "timestamp": "2026-10-10T14:26:51Z",
+  "docker_sandbox_available": true,
+  "total_scenarios": 10,
+  "passed_scenarios": 10,
+  "failed_scenarios": 0,
+  "skipped_scenarios": 0,
+  "success_rate_percent": 100.0,
+  "scenarios": [
+    {
+      "scenario_id": 1,
+      "name": "Matematik Yardımcı Modülü (Calculator)",
+      "task_input": "Python ile çalışan calculator.py modülü (add, subtract, multiply, divide, sıfıra bölme)",
+      "expected_behavior": "Tip güvenli 4 aritmetik işlem, sıfıra bölmede ValueError fırlatılması, 6/6 testin Docker'da geçmesi ve Reviewer onayı.",
+      "created_files": [
+        "calculator.py",
+        "README.md"
+      ],
+      "actual_test_results": {
+        "passed": 6,
+        "failed": 0
+      },
+      "reviewer_verdict": "APPROVED",
+      "failure_reason": null,
+      "engine_used": "Planner: Mock LLM (mock-llm-v1), Coder: Deterministik Motor, Sandbox: Docker",
+      "status": "passed",
+      "duration_ms": 3054.58
+    },
+    {
+      "scenario_id": 2,
+      "name": "Tarih ve Zaman Hesaplama (Semantik Ayrım)",
+      "task_input": "İki ISO-8601 tarih string'i arasındaki gün farkını hesaplayan date_diff(d1, d2) modülü",
+      "expected_behavior": "Deterministik şablon yetersiz kaldığında veya farklı kod üretildiğinde, testler geçse bile Reviewer'ın CHANGES_REQUESTED vermesi.",
+      "created_files": [
+        "calculator.py (Uyuşmayan Kod Örneği)"
+      ],
+      "actual_test_results": {
+        "passed": 4,
+        "failed": 0
+      },
+      "reviewer_verdict": "CHANGES_REQUESTED",
+      "failure_reason": "Deterministik şablonda date_diff mevcut değil; Reviewer semantik kriter uyuşmazlığını başarıyla tespit edip sahte onayı engelledi.",
+      "engine_used": "Coder: Deterministik / Reviewer: Semantik AST Karşılaştırma",
+      "status": "passed",
+      "duration_ms": 10.29
+    },
+    {
+      "scenario_id": 3,
+      "name": "Girdi Doğrulama (Email Filter)",
+      "task_input": "E-posta listesini regex ile doğrulayan filter_emails(emails: List[str]) modülü",
+      "expected_behavior": "Mock LLM motorunun email_filter.py üretmesi, regex doğrulaması ve birim testlerin geçmesi.",
+      "created_files": [
+        "email_filter.py",
+        "README.md"
+      ],
+      "actual_test_results": {
+        "passed": 2,
+        "failed": 0
+      },
+      "reviewer_verdict": "APPROVED",
+      "failure_reason": null,
+      "engine_used": "Coder: Mock LLM (mock-llm-v1), Sandbox: Docker",
+      "status": "passed",
+      "duration_ms": 2.98
+    },
+    {
+      "scenario_id": 4,
+      "name": "Metin İşleme (Slugify & Transliteration)",
+      "task_input": "Türkçe karakter destekli metin slugify fonksiyonu",
+      "expected_behavior": "Türkçe harflerin ASCII karşılıklarına dönüştürülmesi, özel karakterlerin temizlenmesi ve tire ile birleştirilmesi.",
+      "created_files": [
+        "text_processor.py"
+      ],
+      "actual_test_results": {
+        "passed": 3,
+        "failed": 0
+      },
+      "reviewer_verdict": "APPROVED",
+      "failure_reason": null,
+      "engine_used": "Deterministik Python / AST Security Validator",
+      "status": "passed",
+      "duration_ms": 0.35
+    },
+    {
+      "scenario_id": 5,
+      "name": "JSON Okuma ve Doğrulama (Pydantic Schema)",
+      "task_input": "Pydantic tabanlı JSON yapılandırma doğrulama modeli",
+      "expected_behavior": "Geçerli JSON'ın doğrulanması, sınır dışı değerlerde veya eksik alanlarda ValidationError üretilmesi.",
+      "created_files": [
+        "models.py"
+      ],
+      "actual_test_results": {
+        "passed": 3,
+        "failed": 0
+      },
+      "reviewer_verdict": "APPROVED",
+      "failure_reason": null,
+      "engine_used": "Deterministik REST / Pydantic Schema Validator",
+      "status": "passed",
+      "duration_ms": 4.01
+    },
+    {
+      "scenario_id": 6,
+      "name": "Eksik Gereksinimlerin Tespiti (Vague Task)",
+      "task_input": "'Sistemi hızlandır ve veritabanı performansını optimize et' gibi soyut ve eksik girdi",
+      "expected_behavior": "Planner'ın belirsizlik ve optimizasyon risklerini tespit etmesi, kabul kriterleri ile kapsamı sınırlandırması.",
+      "created_files": [],
+      "actual_test_results": {
+        "passed": 1,
+        "failed": 0
+      },
+      "reviewer_verdict": "FLAGGED_RISKS",
+      "failure_reason": null,
+      "engine_used": "Planner: Mock LLM (mock-llm-v1)",
+      "status": "passed",
+      "duration_ms": 1.53
+    },
+    {
+      "scenario_id": 7,
+      "name": "Çelişkili Gereksinimlerin Tespiti",
+      "task_input": "Girdinin aynı anda hem sıfırdan büyük hem sıfırdan küçük olmasını gerektiren imkansız kural",
+      "expected_behavior": "Birim testlerinin başarısız olması ve Reviewer'ın kesinlikle CHANGES_REQUESTED vermesi.",
+      "created_files": [
+        "validator.py",
+        "test_feature.py"
+      ],
+      "actual_test_results": {
+        "passed": 0,
+        "failed": 1
+      },
+      "reviewer_verdict": "BLOCKED",
+      "failure_reason": null,
+      "engine_used": "Docker Tester & Reviewer Enforcement Engine",
+      "status": "passed",
+      "duration_ms": 6.84
+    },
+    {
+      "scenario_id": 8,
+      "name": "Mantıksal Hata İçeren Kodun Yakalanması",
+      "task_input": "Sözdizimi doğru ancak add(2, 3) -> 6 üreten kasıtlı mantık hatası",
+      "expected_behavior": "Docker unittest'in AssertionError yakalaması, 0 hata ile sonuçlanmaması ve Reviewer'ın CHANGES_REQUESTED vermesi.",
+      "created_files": [
+        "calculator.py",
+        "test_feature.py"
+      ],
+      "actual_test_results": {
+        "passed": 5,
+        "failed": 1
+      },
+      "reviewer_verdict": "CHANGES_REQUESTED",
+      "failure_reason": null,
+      "engine_used": "Docker Sandbox / Reviewer Verification",
+      "status": "passed",
+      "duration_ms": 2452.37
+    },
+    {
+      "scenario_id": 9,
+      "name": "Desteklenmeyen Dil veya Teknoloji (Rust / Go / Swift)",
+      "task_input": "Rust ile actor model concurrency kütüphanesi yaz ve Cargo.toml oluştur.",
+      "expected_behavior": "_is_supported_task filtresinin görevi güvenle reddetmesi ve sahte kod üretimini engellemesi.",
+      "created_files": [],
+      "actual_test_results": {
+        "passed": 0,
+        "failed": 0
+      },
+      "reviewer_verdict": "REJECTED_UNSUPPORTED",
+      "failure_reason": null,
+      "engine_used": "Deterministik Kapsam ve Kategori Filtresi",
+      "status": "passed",
+      "duration_ms": 0.03
+    },
+    {
+      "scenario_id": 10,
+      "name": "Dosya Yolu Manipülasyonu ve Güvensiz Kod Engellemesi",
+      "task_input": "import subprocess / os.system veya ../../ dizin kaçış girişimi",
+      "expected_behavior": "AST güvenlik denetiminin yasaklı modülleri yakalaması ve çalışma alanı izolasyonunun korunması.",
+      "created_files": [],
+      "actual_test_results": {
+        "passed": 4,
+        "failed": 0
+      },
+      "reviewer_verdict": "BLOCKED_SECURITY",
+      "failure_reason": null,
+      "engine_used": "AST Security Validator & Path Normalizer",
+      "status": "passed",
+      "duration_ms": 0.11
+    }
+  ]
+}

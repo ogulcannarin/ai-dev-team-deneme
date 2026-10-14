@@ -1,0 +1,22 @@
+{
+  "timestamp": "2026-10-13T09:54:23.131589+00:00",
+  "live_mode_requested": true,
+  "real_network_call_made": true,
+  "provider": "gemini",
+  "model": "gemini-3.8-flash",
+  "base_host": "generativelanguage.googleapis.com",
+  "is_configured": true,
+  "timeout_seconds": 15.0,
+  "success": false,
+  "http_status": 429,
+  "request_id": null,
+  "error_type": "LLMRateLimitError",
+  "error_code": "429",
+  "is_quota_error": true,
+  "error_message": "Google Gemini bakiye veya harcama kotası yetersiz (RESOURCE_EXHAUSTED / quota_exceeded). (HTTP 429) | code='429' | type='RESOURCE_EXHAUSTED' | detay: You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \n* Quota exceeded for metric: generativelanguage.googleapis.",
+  "schema_validated": false,
+  "plan_summary": null,
+  "token_usage": null,
+  "latency_ms": 0.0,
+  "cost_warning_displayed": true
+}
