@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from agent_workflow import recover_unpersisted_decisions, resume_agent_workflow
 from database import get_db_connection, init_db
 from main import app
-from repository import TaskRepository
+from repository import TaskRepository, WorkflowRunRepository
 from schemas import ReviewerResult, ReviewerVerdict, TaskStatus
 from schemas import TesterResult as SchemaTesterResult
 
@@ -46,8 +46,12 @@ def _remove_tree(path: str) -> None:
         os.chmod(target, stat.S_IWRITE)
         func(target)
 
-    if os.path.lexists(path):
+    if not os.path.lexists(path):
+        return
+    if sys.version_info >= (3, 12):
         shutil.rmtree(path, onexc=_onerror)
+    else:
+        shutil.rmtree(path, onerror=_onerror)
 
 
 def _remove_task_delivery(task_id: str) -> None:
@@ -111,6 +115,9 @@ def test_crash_recovery_is_idempotent_and_skips_agents(client, monkeypatch):
         recovered = TaskRepository().get_task(task_id)
         assert recovered is not None
         assert recovered.status == TaskStatus.COMPLETED.value
+        runs = WorkflowRunRepository().list_runs_for_task(task_id)
+        assert len(runs) == 1
+        assert runs[0].status == TaskStatus.COMPLETED
         assert _event_count(recovered.events, "task_approved") == 1
         assert _event_count(recovered.events, "plan_created") == planner_before
         assert _event_count(recovered.events, "coder_completed") == coder_before
@@ -137,7 +144,7 @@ def test_new_process_recovers_without_rerunning_agents(client, tmp_path):
             "os.environ['LLM_PROVIDER'] = 'mock'\n"
             "os.environ['EXECUTION_ENGINE'] = 'mock'\n"
             "import agent_workflow\n"
-            "from repository import TaskRepository\n"
+            "from repository import TaskRepository, WorkflowRunRepository\n"
             "def boom(*_args, **_kwargs):\n"
             "    raise SystemExit('agent calisti')\n"
             "agent_workflow.planner_node = boom\n"
@@ -149,8 +156,12 @@ def test_new_process_recovers_without_rerunning_agents(client, tmp_path):
             "    assert task_id in recovered\n"
             "    assert task.status.value == 'completed'\n"
             "    assert sum(1 for event in task.events if event.type == 'task_approved') == 1\n"
+            "    runs = WorkflowRunRepository().list_runs_for_task(task_id)\n"
+            "    assert len(runs) == 1 and runs[0].status.value == 'completed'\n"
             "    again = await agent_workflow.recover_unpersisted_decisions()\n"
             "    assert again == []\n"
+            "    runs_again = WorkflowRunRepository().list_runs_for_task(task_id)\n"
+            "    assert len(runs_again) == 1 and runs_again[0].id == runs[0].id\n"
             "    reread = TaskRepository().get_task(task_id)\n"
             "    assert sum(1 for event in reread.events if event.type == 'task_approved') == 1\n"
             "asyncio.run(main())\n",
@@ -195,6 +206,12 @@ def test_missing_or_unverified_checkpoint_is_not_completed(client):
         assert missing_task.status == TaskStatus.AWAITING_APPROVAL
         assert missing_task.status != TaskStatus.COMPLETED
         assert _event_count(missing_task.events, "task_approved") == 0
+        for task_id in (pending_id, missing_id):
+            runs = WorkflowRunRepository().list_runs_for_task(task_id)
+            assert len(runs) == 1
+            assert runs[0].status == TaskStatus.AWAITING_APPROVAL
+            assert runs[0].status != TaskStatus.FAILED
+            assert runs[0].status != TaskStatus.COMPLETED
     finally:
         _remove_task_delivery(pending_id)
         _remove_task_delivery(missing_id)
@@ -212,6 +229,48 @@ def _reviewed_shell(client: TestClient) -> str:
         error=None,
     )
     return task_id
+
+
+def test_partial_run_update_is_repaired_without_a_new_run(client, monkeypatch):
+    task_id = _awaiting_gap(client)
+    try:
+        asyncio.run(resume_agent_workflow(
+            task_id,
+            {"action": "approve", "approved_by": "lead", "comment": "run eksik"},
+        ))
+        original = WorkflowRunRepository.complete_run
+
+        def _fail_run(self, *args, **kwargs):
+            raise RuntimeError("run yazılamadı")
+
+        monkeypatch.setattr(WorkflowRunRepository, "complete_run", _fail_run)
+        first = asyncio.run(recover_unpersisted_decisions())
+        monkeypatch.setattr(WorkflowRunRepository, "complete_run", original)
+        assert task_id in first
+        assert TaskRepository().get_task(task_id).status == TaskStatus.COMPLETED
+        stalled = WorkflowRunRepository().list_runs_for_task(task_id)
+        assert len(stalled) == 1
+        assert stalled[0].status == TaskStatus.AWAITING_APPROVAL
+        stalled_id = stalled[0].id
+
+        def _forbidden(*_args, **_kwargs):
+            raise AssertionError("Planner veya Coder run onarımında çalıştı")
+
+        monkeypatch.setattr("agent_workflow.planner_node", _forbidden)
+        monkeypatch.setattr("agent_workflow.coder_node", _forbidden)
+        repaired = asyncio.run(recover_unpersisted_decisions())
+        repeated = asyncio.run(recover_unpersisted_decisions())
+        assert repaired == [task_id]
+        assert repeated == []
+        runs = WorkflowRunRepository().list_runs_for_task(task_id)
+        assert len(runs) == 1
+        assert runs[0].id == stalled_id
+        assert runs[0].status == TaskStatus.COMPLETED
+        task = TaskRepository().get_task(task_id)
+        assert task.status == TaskStatus.COMPLETED
+        assert _event_count(task.events, "task_approved") == 1
+    finally:
+        _remove_task_delivery(task_id)
 
 
 def test_reviewed_without_approved_evidence_is_not_completed(client):

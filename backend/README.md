@@ -93,6 +93,24 @@ DEFAULT_PLANNER_MODE=deterministic
 
 ---
 
+## GitHub Pull Request Teslimatı
+
+Yerel teslimat `backend/workspaces/.delivery/{task_id}.git` altında `task/{task_id}` dalına commit yazar. Bu davranış GitHub ayarı olmasa da aynı kalır.
+
+GitHub entegrasyonu isteğe bağlıdır. `GITHUB_TOKEN` ile birlikte `GITHUB_OWNER` ve `GITHUB_REPO` ya da `GITHUB_REPOSITORY=owner/repo` tanımlıysa, yerel commit başarılı olduktan sonra nesneler `git push --no-force` ile yalnızca `refs/heads/task/{task_id}` hedefine aktarılır. Böylece GitHub’daki commit SHA’sı yerel SHA ile aynı kalır. Uzak dal zaten bu SHA’daysa push yapılmaz. Hızlı ileri alınamayan uzak commit’te force push yapılmaz. Branch sorgusu ve pull request oluşturma GitHub REST API ile yapılır. `GITHUB_BASE_BRANCH` (varsayılan `main`) yalnızca pull request hedefidir. `main` dalına push veya merge yapılmaz. Aynı SHA ve aynı açık pull request tekrar oluşturulmaz. Token remote URL’sine ve Git argümanlarına yazılmaz; yalnızca bu sürecin HTTP başlığı ortam değişkeninde tutulur.
+
+Kimlik bilgisi yoksa veya geçersizse yalnızca yerel teslimat çalışır. Kimlik bilgisi varken GitHub kimlik doğrulaması, ağ veya API hatası `delivery_failed` olur; yerel commit SHA'sı korunur. Token loglara, Git komutlarına, URL'lere, olaylara ve API yanıtlarına yazılmaz.
+
+Fine-grained personal access token için yalnızca hedef depoya şu izinler yeterlidir:
+
+- **Contents**: Read and write. Görev dalını ve git nesnelerini yazmak için gerekir.
+- **Pull requests**: Read and write. Açık pull request'i bulmak ve oluşturmak için gerekir.
+- **Metadata**: Read. GitHub bu izni fine-grained token ile birlikte zorunlu tutar.
+
+`Administration`, `Workflows`, depo silme veya klasik `repo` kapsamı gerekmez. Token'ı `.env` içinde tutun ve commit etmeyin.
+
+---
+
 ## Kurulum ve Çalıştırma
 
 ### 1. Sanal Ortamı (Virtual Environment) Aktifleştirme

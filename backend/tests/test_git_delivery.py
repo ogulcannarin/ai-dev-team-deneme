@@ -7,6 +7,7 @@ import asyncio
 import os
 import shutil
 import stat
+import sys
 import subprocess
 import threading
 
@@ -198,8 +199,12 @@ def _remove_tree(path: str) -> None:
         os.chmod(target, stat.S_IWRITE)
         func(target)
 
-    if os.path.lexists(path):
+    if not os.path.lexists(path):
+        return
+    if sys.version_info >= (3, 12):
         shutil.rmtree(path, onexc=_onerror)
+    else:
+        shutil.rmtree(path, onerror=_onerror)
 
 
 def _remove_task_delivery(task_id: str) -> None:

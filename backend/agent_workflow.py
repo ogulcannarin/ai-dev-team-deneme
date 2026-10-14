@@ -64,7 +64,15 @@ from execution import (
     ExecutionResult,
     get_execution_engine,
 )
-from git_delivery import deliver_task_workspace
+from git_delivery import branch_name_for, deliver_task_workspace
+from github_delivery import (
+    GitHubAPIError,
+    GitHubAuthError,
+    GitHubNetworkError,
+    load_github_config,
+    mask_secrets,
+    publish_github_delivery,
+)
 
 
 # --- Güvenlik & Dosya Dışlama Sabitleri ---
@@ -3409,6 +3417,18 @@ def _delivery_sha_recorded(events: List[Any], sha: Optional[str]) -> bool:
     return False
 
 
+def _github_success_recorded(events: List[Any], sha: Optional[str]) -> bool:
+    if not sha:
+        return False
+    for event in events:
+        if _event_type(event) not in {"github_pr_opened", "github_pr_reused"}:
+            continue
+        details = event.get("details") if isinstance(event, dict) else getattr(event, "details", None)
+        if isinstance(details, dict) and details.get("commit") == sha:
+            return True
+    return False
+
+
 def _status_after_successful_delivery(state: AgentWorkflowState) -> str:
     """completed, insan onayı ve güncel içeriğin commit'i birlikte bittiğinde kullanılır."""
     events = state.get("events") or []
@@ -3417,6 +3437,139 @@ def _status_after_successful_delivery(state: AgentWorkflowState) -> str:
     if state.get("status") == TaskStatus.COMPLETED.value:
         return TaskStatus.COMPLETED.value
     return TaskStatus.REVIEWED.value
+
+
+def _local_delivery_event(outcome: Dict[str, object], status: str) -> Dict[str, Any]:
+    event_type = {
+        "committed": "delivery_committed",
+        "reused": "delivery_reused",
+    }.get(status, "delivery_failed")
+    previous = outcome.get("previous_commit")
+    if event_type == "delivery_committed" and previous:
+        message = "Değişen içerik aynı izole branch üzerinde yeni commit olarak yazıldı."
+    elif event_type == "delivery_committed":
+        message = "Görev değişiklikleri izole branch üzerinde commit edildi."
+    elif event_type == "delivery_reused":
+        message = "Aynı içerik için mevcut teslimat commit'i yeniden kullanıldı."
+    else:
+        message = "Teslimat commit'i oluşturulamadı."
+    return _create_event(
+        source="ORCHESTRATOR",
+        event_type=event_type,
+        message=message,
+        details={
+            "branch": outcome.get("branch"),
+            "commit": outcome.get("commit"),
+            "previous_commit": previous,
+            "reason": outcome.get("reason"),
+            "files": outcome.get("files") or [],
+        },
+    )
+
+
+def _apply_github_delivery(
+    state: AgentWorkflowState,
+    events: List[Any],
+    sha: str,
+) -> AgentWorkflowState:
+    """Yerel SHA durur. Başarılı PR olayı yoksa uzak dal ve PR uzlaştırılır."""
+    task_id = str(state.get("task_id") or "")
+    try:
+        branch = branch_name_for(task_id)
+    except ValueError:
+        branch = None
+    try:
+        result = publish_github_delivery(
+            task_id,
+            _get_safe_workspaces_root(),
+            sha,
+            f"Deliver task {task_id}",
+            "Yerel görev dalının pull request teslimatı.",
+        )
+    except GitHubAuthError as exc:
+        return _github_failure(state, events, sha, branch, "github_auth_failed", str(exc))
+    except GitHubNetworkError as exc:
+        return _github_failure(state, events, sha, branch, "github_network_failed", str(exc))
+    except GitHubAPIError as exc:
+        return _github_failure(state, events, sha, branch, "github_failed", str(exc))
+    except Exception:
+        return _github_failure(
+            state,
+            events,
+            sha,
+            branch,
+            "github_failed",
+            "GitHub teslimatı tamamlanamadı.",
+        )
+
+    kind = str(result.get("status") or "")
+    if kind not in {"opened", "reused"}:
+        return _github_failure(
+            state,
+            events,
+            sha,
+            branch,
+            "github_failed",
+            "GitHub pull request sonucu doğrulanamadı.",
+        )
+    event_type = "github_pr_opened" if kind == "opened" else "github_pr_reused"
+    message = (
+        "Görev dalı için GitHub pull request açıldı."
+        if kind == "opened"
+        else "Aynı görev dalı için mevcut GitHub pull request yeniden kullanıldı."
+    )
+    token = os.environ.get("GITHUB_TOKEN")
+    events.append(_create_event(
+        source="ORCHESTRATOR",
+        event_type=event_type,
+        message=message,
+        details={
+            "branch": result.get("branch"),
+            "commit": sha,
+            "base": result.get("base"),
+            "pr_number": result.get("pr_number"),
+            "pr_url": mask_secrets(str(result.get("pr_url") or ""), token),
+        },
+    ))
+    return {
+        **state,
+        "status": _status_after_successful_delivery({**state, "events": events}),
+        "error": None,
+        "events": events,
+    }
+
+
+def _github_failure(
+    state: AgentWorkflowState,
+    events: List[Any],
+    sha: str,
+    branch: Optional[str],
+    event_type: str,
+    message: str,
+) -> AgentWorkflowState:
+    token = os.environ.get("GITHUB_TOKEN")
+    message = mask_secrets(message, token)
+    last = events[-1] if events else None
+    last_details = last.get("details") if isinstance(last, dict) else {}
+    same_failure = (
+        isinstance(last, dict)
+        and last.get("type") == event_type
+        and isinstance(last_details, dict)
+        and last_details.get("commit") == sha
+    )
+    if not same_failure:
+        events.append(_create_event(
+            source="ORCHESTRATOR",
+            event_type=event_type,
+            message=message,
+            details={"branch": branch, "commit": sha, "reason": message},
+        ))
+    return {
+        **state,
+        "status": TaskStatus.DELIVERY_FAILED.value,
+        "error": message,
+        "events": events,
+    }
 
 
 def delivery_node(state: AgentWorkflowState) -> AgentWorkflowState:
@@ -3470,73 +3623,78 @@ def delivery_node(state: AgentWorkflowState) -> AgentWorkflowState:
         filenames,
     )
     status = str(outcome.get("status") or "failed")
-    sha = outcome.get("commit")
-    if status in {"committed", "reused"} and _delivery_sha_recorded(events, str(sha) if sha else None):
+    sha = str(outcome.get("commit")) if outcome.get("commit") else None
+    local_ok = status in {"committed", "reused"} and bool(sha)
+    if not local_ok:
+        events.append(_local_delivery_event(outcome, status))
+        reason = str(outcome.get("reason") or "Teslimat commit'i oluşturulamadı.")
         return {
             **state,
-            "status": _status_after_successful_delivery({**state, "events": events}),
-            "error": None,
+            "status": TaskStatus.DELIVERY_FAILED.value,
+            "error": reason,
             "events": events,
         }
 
-    event_type = {
-        "committed": "delivery_committed",
-        "reused": "delivery_reused",
-    }.get(status, "delivery_failed")
-    previous = outcome.get("previous_commit")
-    if event_type == "delivery_committed" and previous:
-        message = "Değişen içerik aynı izole branch üzerinde yeni commit olarak yazıldı."
-    elif event_type == "delivery_committed":
-        message = "Görev değişiklikleri izole branch üzerinde commit edildi."
-    elif event_type == "delivery_reused":
-        message = "Aynı içerik için mevcut teslimat commit'i yeniden kullanıldı."
-    else:
-        message = "Teslimat commit'i oluşturulamadı."
-    events.append(_create_event(
-        source="ORCHESTRATOR",
-        event_type=event_type,
-        message=message,
-        details={
-            "branch": outcome.get("branch"),
-            "commit": sha,
-            "previous_commit": previous,
-            "reason": outcome.get("reason"),
-            "files": outcome.get("files") or [],
-        },
-    ))
-    if status in {"committed", "reused"}:
+    sha_recorded = _delivery_sha_recorded(events, sha)
+    if not sha_recorded:
+        events.append(_local_delivery_event(outcome, status))
+    github_config = load_github_config()
+    if github_config is None or _github_success_recorded(events, sha):
         return {
             **state,
             "status": _status_after_successful_delivery({**state, "events": events}),
             "error": None,
             "events": events,
         }
-    reason = str(outcome.get("reason") or "Teslimat commit'i oluşturulamadı.")
-    return {
-        **state,
-        "status": TaskStatus.DELIVERY_FAILED.value,
-        "error": reason,
-        "events": events,
-    }
+    return _apply_github_delivery(state, events, sha or "")
 
 
 # --- LangGraph Akışının Tanımlanması ---
 
+def _call_node(fn, state: AgentWorkflowState, config: Optional[dict]):
+    """
+    Python 3.10'da ainvoke, runnable config bağlamını göreve kopyalamaz.
+    interrupt() bu bağlam olmadan get_config hatası verir.
+    """
+    if not config:
+        return fn(state)
+    from langchain_core.runnables.config import var_child_runnable_config
+
+    token = var_child_runnable_config.set(config)
+    try:
+        return fn(state)
+    finally:
+        var_child_runnable_config.reset(token)
+
+
 def _trace_node(name: str, fn):
     """Düğüm başarıyla döndüğünde adını kaydeder. interrupt yükseltirse kayıt yazılmaz."""
     if asyncio.iscoroutinefunction(fn):
-        async def wrapped(state: AgentWorkflowState) -> AgentWorkflowState:
-            result = await fn(state)
+        async def wrapped(state: AgentWorkflowState, config=None) -> AgentWorkflowState:
+            if not config:
+                result = await fn(state)
+            else:
+                from langchain_core.runnables.config import var_child_runnable_config
+
+                token = var_child_runnable_config.set(config)
+                try:
+                    result = await fn(state)
+                finally:
+                    var_child_runnable_config.reset(token)
             executed = list(state.get("executed_nodes") or [])
             executed.append(name)
             return {**result, "executed_nodes": executed}
+
+        wrapped.__name__ = name
         return wrapped
 
-    def wrapped(state: AgentWorkflowState) -> AgentWorkflowState:
-        result = fn(state)
+    def wrapped(state: AgentWorkflowState, config=None) -> AgentWorkflowState:
+        result = _call_node(fn, state, config)
         executed = list(state.get("executed_nodes") or [])
         executed.append(name)
         return {**result, "executed_nodes": executed}
+
+    wrapped.__name__ = name
     return wrapped
 
 
@@ -3901,10 +4059,47 @@ def _recovery_state(task_id: str, snapshot: Dict[str, Any]) -> Optional[AgentWor
     return None
 
 
+_RECOVERY_TASK_STATUSES = {
+    TaskStatus.COMPLETED,
+    TaskStatus.DELIVERY_FAILED,
+    TaskStatus.CHANGES_REQUESTED,
+}
+
+
+def _sync_open_run(run_repo, task) -> bool:
+    """
+    Görevle aynı kararda kalmış awaiting_approval çalıştırmasını günceller.
+    Yeni satır açmaz. Durum zaten aynıysa yazmaz.
+    """
+    if task.status not in _RECOVERY_TASK_STATUSES:
+        return False
+    runs = run_repo.list_runs_for_task(task.id)
+    if not runs:
+        return False
+    latest = runs[-1]
+    if latest.status != TaskStatus.AWAITING_APPROVAL:
+        return False
+    updated = run_repo.complete_run(
+        run_id=latest.id,
+        status=task.status,
+        plan=task.plan,
+        scope=task.scope,
+        coder=task.coder,
+        tester=task.tester,
+        reviewer=task.reviewer,
+        events=task.events or [],
+        error=task.error,
+        completed_at=datetime.now(timezone.utc),
+        duration_ms=latest.duration_ms,
+    )
+    return updated is not None
+
+
 async def recover_unpersisted_decisions(db_path: Optional[str] = None) -> List[str]:
     """
     Onay checkpoint'e yazıldıktan sonra SQLite güncellenmeden kapanan görevleri uzlaştırır.
     Grafiği, Planner'ı ve Coder'ı çalıştırmaz. Karar doğrulanamazsa completed yapmaz.
+    Görev yazıldıktan sonra run-history yazılamazsa sonraki çağrı aynı satırı onarır.
     """
     from repository import TaskRepository, WorkflowRunRepository
 
@@ -3925,11 +4120,7 @@ async def recover_unpersisted_decisions(db_path: Optional[str] = None) -> List[s
         if state is None or state.get("task_id") not in (None, task.id):
             continue
         final_status = state.get("status")
-        if final_status not in {
-            TaskStatus.COMPLETED.value,
-            TaskStatus.DELIVERY_FAILED.value,
-            TaskStatus.CHANGES_REQUESTED.value,
-        }:
+        if final_status not in {item.value for item in _RECOVERY_TASK_STATUSES}:
             continue
         if final_status == TaskStatus.COMPLETED.value and not has_completion_evidence(
             state.get("reviewer") or {}, state.get("tester") or {}
@@ -3950,25 +4141,23 @@ async def recover_unpersisted_decisions(db_path: Optional[str] = None) -> List[s
         if not updated:
             continue
         try:
-            runs = run_repo.list_runs_for_task(task.id)
-            if runs:
-                run_repo.complete_run(
-                    run_id=runs[-1].id,
-                    status=TaskStatus(final_status),
-                    plan=state.get("plan"),
-                    scope=state.get("scope"),
-                    coder=state.get("coder"),
-                    tester=state.get("tester"),
-                    reviewer=state.get("reviewer"),
-                    events=state.get("events") or [],
-                    error=state.get("error"),
-                    completed_at=datetime.now(timezone.utc),
-                )
+            _sync_open_run(run_repo, updated)
         except Exception:
             logging.getLogger(__name__).exception(
                 "Görev %s kaydı uzlaştırıldı fakat çalıştırma geçmişi güncellenemedi.", task.id
             )
         recovered.append(task.id)
+
+    for task in repo.list_tasks():
+        if task.status not in _RECOVERY_TASK_STATUSES:
+            continue
+        try:
+            if _sync_open_run(run_repo, task) and task.id not in recovered:
+                recovered.append(task.id)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Görev %s çalıştırma geçmişi onarılamadı. Görev durumu değiştirilmedi.", task.id
+            )
     return recovered
 
 

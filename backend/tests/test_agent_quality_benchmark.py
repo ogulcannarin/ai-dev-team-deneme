@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
 import time
 from typing import Any, Dict, List
@@ -512,8 +513,12 @@ def test_benchmark_09_hitl_approval_and_rejection(client):
 
     delivery_root = os.path.join(_get_safe_workspaces_root(), ".delivery")
     for path in (workspace, os.path.join(delivery_root, f"{t1_id}.git")):
-        if os.path.lexists(path):
+        if not os.path.lexists(path):
+            continue
+        if sys.version_info >= (3, 12):
             shutil.rmtree(path, onexc=_onerror)
+        else:
+            shutil.rmtree(path, onerror=_onerror)
     lock_path = os.path.join(delivery_root, f"{t1_id}.lock")
     if os.path.lexists(lock_path):
         os.chmod(lock_path, stat.S_IWRITE)
