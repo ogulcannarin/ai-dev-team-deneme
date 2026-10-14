@@ -13,6 +13,7 @@ Güvenlik Politikası:
 
 import os
 import shutil
+import stat
 import subprocess
 import time
 import uuid
@@ -126,6 +127,7 @@ class DockerExecutionEngine(BaseExecutionEngine):
                 error=f"Docker daemon erişilemez veya çalışmıyor ({diag_msg}). Kod host üzerinde çalıştırılmadı."
             )
 
+        _grant_sandbox_read(workspace_path)
         start_time = time.perf_counter()
         docker_cmd = self._get_docker_cmd()
         docker_mount_path = self.format_docker_mount_path(workspace_path)
@@ -178,7 +180,7 @@ class DockerExecutionEngine(BaseExecutionEngine):
                 duration_ms=duration_ms,
                 isolation_type=self.get_isolation_type(),
                 raw_output=raw_output,
-                error=None if completed.returncode == 0 else f"Process exited with code {completed.returncode}"
+                error=None if completed.returncode == 0 else _failure_detail(completed.returncode, stderr, stdout)
             )
         except subprocess.TimeoutExpired:
             duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
@@ -220,3 +222,37 @@ class DockerExecutionEngine(BaseExecutionEngine):
                 subprocess.run([docker_cmd, "rm", "-f", container_name], capture_output=True, timeout=1.0, stdin=subprocess.DEVNULL)
             except Exception:
                 pass
+
+
+def _grant_sandbox_read(workspace_path: str) -> None:
+    """
+    Linux geçici dizinleri 0700 olur ve sahibi runner uid 1001 olabilir.
+    Sandbox --user 1000:1000 bu dosyayı okuyamaz. Mount salt okunur kalır.
+    """
+    if os.name == "nt":
+        return
+    for root, _dirs, files in os.walk(workspace_path, followlinks=False):
+        _add_other_mode(root, 0o005)
+        for name in files:
+            path = os.path.join(root, name)
+            if os.path.islink(path):
+                continue
+            _add_other_mode(path, 0o004)
+
+
+def _add_other_mode(path: str, extra: int) -> None:
+    try:
+        mode = os.lstat(path).st_mode
+        if stat.S_ISLNK(mode):
+            return
+        os.chmod(path, stat.S_IMODE(mode) | extra)
+    except OSError:
+        return
+
+
+def _failure_detail(exit_code: int, stderr: str, stdout: str) -> str:
+    text = (stderr or stdout or "").strip()
+    line = text.splitlines()[-1][:300] if text else ""
+    if line:
+        return f"Process exited with code {exit_code}: {line}"
+    return f"Process exited with code {exit_code}"

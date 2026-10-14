@@ -192,10 +192,22 @@ def _get_safe_workspaces_root() -> str:
     return workspaces_dir
 
 
+_WINDOWS_DRIVE_ABS = re.compile(r"^[A-Za-z]:[\\/]")
+
+
 def _is_path_safe(target_path: str, base_root: str) -> bool:
     """
     Path traversal saldırılarını engellemek için hedefin kök dizin içinde olduğunu doğrular.
+    Bu işletim sisteminin mutlak saymadığı Windows sürücü ve UNC yolları reddedilir.
     """
+    if not isinstance(target_path, str) or not target_path:
+        return False
+    if not os.path.isabs(target_path) and (
+        _WINDOWS_DRIVE_ABS.match(target_path) is not None
+        or target_path.startswith("\\\\")
+        or target_path.startswith("//")
+    ):
+        return False
     try:
         resolved = os.path.abspath(target_path)
         common = os.path.commonpath([base_root, resolved])
