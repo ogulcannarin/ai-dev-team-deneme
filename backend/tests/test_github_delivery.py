@@ -66,7 +66,7 @@ class FakeGitHub:
             return GitHubResponse(200, list(self.pulls))
         if method == "POST" and path.endswith("/pulls"):
             if self.create_status == 422:
-                return GitHubResponse(422, {"message": "A pull request already exists"})
+                return GitHubResponse(422, getattr(self, "create_body", None) or {"message": "A pull request already exists"})
             pull = {
                 "number": 9,
                 "html_url": "https://github.com/acme/widgets/pull/9",
@@ -88,7 +88,7 @@ def _config(**overrides) -> GitHubConfig:
     return GitHubConfig(**values)
 
 
-def _client(fake: FakeGitHub, ancestor=True, pusher=None) -> GitHubClient:
+def _client(fake: FakeGitHub, ancestor=True, pusher=None, history=True) -> GitHubClient:
     def _push(**kwargs):
         fake.pushes.append(kwargs)
         fake.remote = kwargs["sha"]
@@ -98,11 +98,12 @@ def _client(fake: FakeGitHub, ancestor=True, pusher=None) -> GitHubClient:
         transport=fake,
         ancestor_check=lambda _remote, _local: ancestor,
         pusher=pusher or _push,
+        history_check=lambda *_args: history,
     )
 
 
-def _publish(fake: FakeGitHub, sha: str = SHA, ancestor: bool = True, pusher=None):
-    return _client(fake, ancestor=ancestor, pusher=pusher).publish(
+def _publish(fake: FakeGitHub, sha: str = SHA, ancestor: bool = True, pusher=None, history=True):
+    return _client(fake, ancestor=ancestor, pusher=pusher, history=history).publish(
         task_id=TASK_ID,
         sha=sha,
         title="Deliver task",
@@ -185,6 +186,35 @@ def test_repository_env_and_defaults(monkeypatch):
     assert config.base_branch == "main"
     monkeypatch.setenv("GITHUB_BASE_BRANCH", "develop")
     assert load_github_config().base_branch == "develop"
+
+
+def test_push_is_blocked_without_shared_history():
+    fake = FakeGitHub()
+    with pytest.raises(GitHubAPIError, match="ortak geçmiş"):
+        _publish(fake, history=False)
+    assert fake.pushes == []
+    assert not any(call["method"] == "POST" for call in fake.calls)
+
+
+def test_pull_request_validation_error_keeps_safe_detail():
+    fake = FakeGitHub()
+    fake.create_status = 422
+    fake.create_body = {
+        "message": "Validation Failed",
+        "errors": [{
+            "resource": "PullRequest",
+            "field": "head",
+            "code": "invalid",
+            "message": f"no history in common {TOKEN}",
+        }],
+    }
+    with pytest.raises(GitHubAPIError) as caught:
+        _publish(fake)
+    message = str(caught.value)
+    assert "Validation Failed" in message
+    assert "head: no history in common" in message
+    assert TOKEN not in message
+    assert "[MASKED_KEY]" in message
 
 
 def test_push_opens_one_pull_request():

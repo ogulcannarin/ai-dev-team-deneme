@@ -27,6 +27,7 @@ from git_delivery import (
     _sha_ok,
     _workspace_path,
     branch_name_for,
+    shares_base_history,
 )
 
 
@@ -185,11 +186,13 @@ class GitHubClient:
         transport=None,
         ancestor_check: Optional[Callable[[str, str], bool]] = None,
         pusher: Optional[Callable[..., None]] = None,
+        history_check: Optional[Callable[..., bool]] = None,
     ):
         self.config = config
         self.transport = transport or HttpxTransport(config)
         self._ancestor_check = ancestor_check
         self._pusher = pusher
+        self._history_check = history_check
 
     def publish(
         self,
@@ -205,6 +208,8 @@ class GitHubClient:
         self._assert_task_branch(branch)
         if not _sha_ok(sha) or len(sha) != 40:
             raise GitHubAPIError("Geçersiz commit. Push yapılmadı.")
+        if not self._shares_base_history(sha, workspace, git_dir):
+            raise GitHubAPIError("Görev dalı ana dalla ortak geçmişe sahip değil. Push yapılmadı.")
         remote_sha = self._remote_sha(branch)
         if remote_sha != sha:
             if remote_sha is not None and not self._can_fast_forward(remote_sha, sha, workspace, git_dir):
@@ -245,6 +250,11 @@ class GitHubClient:
             refspec=refspec,
             token=self.config.token,
         )
+
+    def _shares_base_history(self, sha: str, workspace: str, git_dir: str) -> bool:
+        if self._history_check is not None:
+            return bool(self._history_check(sha, workspace, git_dir))
+        return shares_base_history(workspace, git_dir, sha, self.config.base_branch)
 
     def _assert_task_branch(self, branch: str) -> None:
         base = self.config.base_branch
@@ -510,7 +520,7 @@ def publish_github_delivery(
 def _safe_api_message(status: int, body: object, token: str) -> str:
     if status in {401, 403}:
         return "GitHub kimlik doğrulaması başarısız. Pull request açılmadı."
-    detail = mask_secrets(_body_message(body), token)[:160] or "istek reddedildi"
+    detail = mask_secrets(_body_message(body), token)[:240] or "istek reddedildi"
     if status >= 500:
         return f"GitHub API hatası ({status}). {detail}"
     return f"GitHub API hatası ({status}). {detail}"
@@ -518,7 +528,23 @@ def _safe_api_message(status: int, body: object, token: str) -> str:
 
 def _body_message(body: object) -> str:
     if isinstance(body, dict):
-        return str(body.get("message") or "")
+        parts = []
+        message = str(body.get("message") or "").strip()
+        if message:
+            parts.append(message)
+        errors = body.get("errors")
+        if isinstance(errors, list):
+            for item in errors[:3]:
+                if isinstance(item, dict):
+                    text = str(item.get("message") or item.get("code") or "").strip()
+                    field = str(item.get("field") or "").strip()
+                    if text and field:
+                        parts.append(f"{field}: {text}")
+                    elif text:
+                        parts.append(text)
+                elif isinstance(item, str) and item.strip():
+                    parts.append(item.strip())
+        return "; ".join(parts)
     if isinstance(body, str):
         return body
     return ""

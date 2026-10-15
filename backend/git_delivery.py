@@ -233,11 +233,86 @@ def _restore_index(workspace: str, env: Dict[str, str], branch: str) -> None:
         _run_git(["read-tree", "--empty"], workspace, env)
 
 
-def _stage_tree(workspace: str, env: Dict[str, str], names: List[str]) -> subprocess.CompletedProcess:
-    cleared = _run_git(["read-tree", "--empty"], workspace, env)
-    if cleared.returncode != 0:
-        return cleared
+def _stage_tree(workspace: str, env: Dict[str, str], names: List[str], parent_sha: str) -> subprocess.CompletedProcess:
+    """Ana dal ağacını indekse alır ve yalnızca görev dosyalarını bunun üzerine yazar."""
+    loaded = _run_git(["read-tree", "--", parent_sha], workspace, env)
+    if loaded.returncode != 0:
+        return loaded
     return _run_git(["add", "--", *names], workspace, env)
+
+
+def _find_base_git_dir(start: str) -> Optional[str]:
+    """Görev çalışma alanının üzerindeki salt okunur proje deposunu bulur."""
+    current = os.path.abspath(start)
+    for _ in range(12):
+        candidate = os.path.join(current, ".git")
+        if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "HEAD")):
+            return candidate
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+    return None
+
+
+def _base_branch_name() -> str:
+    name = os.environ.get("GITHUB_BASE_BRANCH", "main").strip() or "main"
+    if name.startswith("-") or "/" in name or ".." in name or name in {"HEAD"}:
+        return "main"
+    return name
+
+
+def _base_ref(branch: str) -> str:
+    return f"refs/delivery-base/{branch}"
+
+
+def _import_base_commit(workspace: str, env: Dict[str, str], source_git: str, git_dir: str) -> Optional[str]:
+    """Ana dal nesnelerini teslimat deposuna kopyalar. Kaynak depoyu ve ana dalı değiştirmez."""
+    source = os.path.abspath(source_git)
+    if (
+        not os.path.isdir(source)
+        or os.path.normcase(source) == os.path.normcase(os.path.abspath(git_dir))
+        or source.startswith(("http://", "https://"))
+        or "@" in source
+    ):
+        return None
+    branch = _base_branch_name()
+    destination = _base_ref(branch)
+    fetched = _run_git(
+        ["fetch", "--no-tags", "--", source, f"refs/heads/{branch}:{destination}"],
+        workspace,
+        env,
+    )
+    if fetched.returncode != 0:
+        return None
+    probe = _run_git(["rev-parse", "--verify", "--end-of-options", destination], workspace, env)
+    sha = probe.stdout.strip()
+    if probe.returncode != 0 or not _sha_ok(sha) or len(sha) != 40:
+        return None
+    return sha
+
+
+def _is_ancestor(workspace: str, env: Dict[str, str], base_sha: str, commit_sha: str) -> bool:
+    if not _sha_ok(base_sha) or not _sha_ok(commit_sha):
+        return False
+    result = _run_git(["merge-base", "--is-ancestor", base_sha, commit_sha], workspace, env)
+    return result.returncode == 0
+
+
+def shares_base_history(workspace: str, git_dir: str, sha: str, base_branch: str = "main") -> bool:
+    """Görev commit'i teslimat deposundaki ana dal tabanının soyundan mı bakar."""
+    if not os.path.isdir(git_dir) or not _sha_ok(sha):
+        return False
+    env = _git_env(workspace, git_dir)
+    probe = _run_git(
+        ["rev-parse", "--verify", "--end-of-options", _base_ref(base_branch)],
+        workspace,
+        env,
+    )
+    base_sha = probe.stdout.strip()
+    if probe.returncode != 0:
+        return False
+    return _is_ancestor(workspace, env, base_sha, sha)
 
 
 def deliver_task_workspace(task_id: str, workspaces_root: str, filenames: List[str]) -> Dict[str, object]:
@@ -289,6 +364,9 @@ def _git_dir_initialized(git_dir: str) -> bool:
 def _deliver_locked(task_id: str, workspace: str, git_dir: str, branch: str, names: List[str]) -> Dict[str, object]:
     os.makedirs(os.path.dirname(git_dir), exist_ok=True)
     env = _git_env(workspace, git_dir)
+    source_git = _find_base_git_dir(workspace) or _find_base_git_dir(os.path.dirname(os.path.abspath(__file__)))
+    if not source_git:
+        return _result("failed", branch=branch, files=names, reason="Ana dal geçmişi bulunamadı. Commit oluşturulmadı.")
     if not _git_dir_initialized(git_dir):
         created = _run_git(["init", "-b", branch], workspace, env)
         if created.returncode != 0:
@@ -313,11 +391,26 @@ def _deliver_locked(task_id: str, workspace: str, git_dir: str, branch: str, nam
     if toplevel.returncode != 0 or actual_root != os.path.normcase(workspace):
         return _result("failed", branch=branch, files=names, reason="Git kökü çalışma alanıyla eşleşmiyor. Teslimat durduruldu.")
 
+    base_sha = _import_base_commit(workspace, env, source_git, git_dir)
+    if not base_sha:
+        return _result("failed", branch=branch, files=names, reason="Ana dal geçmişi teslimat deposuna alınamadı. Commit oluşturulmadı.")
+
+    existing = _existing_commit(workspace, branch, env)
+    if existing and not _is_ancestor(workspace, env, base_sha, existing):
+        return _result(
+            "failed",
+            branch=branch,
+            commit=existing,
+            files=names,
+            reason="Mevcut görev dalı ana dalla ortak geçmişe sahip değil. Commit değiştirilmedi.",
+        )
+    git_parent = existing or base_sha
+
     pointed = _point_head(workspace, env, branch)
     if pointed.returncode != 0:
         return _result("failed", branch=branch, files=names, reason="Görev branch'i oluşturulamadı. Ana branch değiştirilmedi.")
 
-    staged = _stage_tree(workspace, env, names)
+    staged = _stage_tree(workspace, env, names, git_parent)
     if staged.returncode != 0:
         _restore_index(workspace, env, branch)
         return _result("failed", branch=branch, files=names, reason="Dosyalar stage edilemedi. Commit oluşturulmadı.")
@@ -327,7 +420,7 @@ def _deliver_locked(task_id: str, workspace: str, git_dir: str, branch: str, nam
         _restore_index(workspace, env, branch)
         return _result("failed", branch=branch, files=names, reason="Teslimat ağacı yazılamadı. Commit oluşturulmadı.")
 
-    parent = _existing_commit(workspace, branch, env)
+    parent = git_parent
     parent_tree = ""
     if parent:
         parsed = _run_git(["rev-parse", "--verify", "--end-of-options", f"{parent}^{{tree}}"], workspace, env)
@@ -369,6 +462,14 @@ def _deliver_locked(task_id: str, workspace: str, git_dir: str, branch: str, nam
             files=names,
             reason=f"Commit tamamlanamadı: {detail[0][:180] if detail else 'bilinmeyen hata'}",
         )
+    if not _is_ancestor(workspace, env, base_sha, sha):
+        _restore_index(workspace, env, branch)
+        return _result(
+            "failed",
+            branch=branch,
+            files=names,
+            reason="Görev commit'i ana dalla ortak geçmişe sahip değil. Branch güncellenmedi.",
+        )
 
     updated = _run_git(["update-ref", f"refs/heads/{branch}", sha], workspace, env)
     if updated.returncode != 0:
@@ -382,4 +483,4 @@ def _deliver_locked(task_id: str, workspace: str, git_dir: str, branch: str, nam
         return _result("failed", branch=branch, commit=sha, previous_commit=parent, files=names, reason="Commit sonrası çalışma alanında .git kaldı.")
     if head_ref.returncode != 0 or head_sha != sha or head_name.stdout.strip() != branch:
         return _result("failed", branch=branch, commit=sha, previous_commit=parent, files=names, reason="Commit sonrası branch doğrulanamadı.")
-    return _result("committed", branch=branch, commit=sha, previous_commit=parent, files=names)
+    return _result("committed", branch=branch, commit=sha, previous_commit=existing, files=names)

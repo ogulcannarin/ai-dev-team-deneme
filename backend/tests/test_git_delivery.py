@@ -132,7 +132,11 @@ def test_isolated_branch_commit_is_idempotent_and_leaves_parent_untouched(tmp_pa
     assert not os.path.lexists(os.path.join(workspace_path, ".git"))
     branch = _git(workspace_path, "rev-parse", "--abbrev-ref", "HEAD", git_dir=git_dir, work_tree=workspace_path)
     assert branch == "task/task_delivery"
-    assert _git(workspace_path, "rev-list", "--count", "HEAD", git_dir=git_dir, work_tree=workspace_path) == "1"
+    assert _git(workspace_path, "rev-parse", "HEAD^", git_dir=git_dir, work_tree=workspace_path) == parent_head
+    tree = _git(workspace_path, "ls-tree", "-r", "--name-only", "HEAD", git_dir=git_dir, work_tree=workspace_path)
+    assert "user.txt" in tree
+    assert "README.md" in tree
+    assert _git(workspace_path, "rev-list", "--count", "HEAD", git_dir=git_dir, work_tree=workspace_path) == "2"
     toplevel = os.path.normcase(os.path.abspath(
         _git(workspace_path, "rev-parse", "--show-toplevel", git_dir=git_dir, work_tree=workspace_path)
     ))
@@ -141,7 +145,7 @@ def test_isolated_branch_commit_is_idempotent_and_leaves_parent_untouched(tmp_pa
     second = deliver_task_workspace(task_id, str(root), ["README.md", "api_feature.py"])
     assert second["status"] == "reused"
     assert second["commit"] == first["commit"]
-    assert _git(workspace_path, "rev-list", "--count", "HEAD", git_dir=git_dir, work_tree=workspace_path) == "1"
+    assert _git(workspace_path, "rev-list", "--count", "HEAD", git_dir=git_dir, work_tree=workspace_path) == "2"
 
     assert _git(str(parent), "rev-parse", "--abbrev-ref", "HEAD") == "main"
     assert _git(str(parent), "rev-parse", "HEAD") == parent_head
@@ -240,7 +244,7 @@ def test_approval_waits_without_commit_then_approve_commits_once(workflow_env, g
         assert committed[0]["details"]["branch"] == f"task/{task_id}"
         _, git_dir = _delivery_paths(os.path.dirname(workspace), task_id)
         assert not os.path.lexists(os.path.join(workspace, ".git"))
-        assert _git(workspace, "rev-list", "--count", "HEAD", git_dir=git_dir, work_tree=workspace) == "1"
+        assert _git(workspace, "rev-list", "--count", "refs/delivery-base/main..HEAD", git_dir=git_dir, work_tree=workspace) == "1"
 
         again = deliver_task_workspace(
             task_id,
@@ -362,7 +366,8 @@ def test_changed_content_gets_a_new_commit(tmp_path, git_available):
     assert third["commit"] != first["commit"]
     assert third["previous_commit"] == first["commit"]
     workspace_path, git_dir = _delivery_paths(str(tmp_path), task_id)
-    assert _git(workspace_path, "rev-list", "--count", "HEAD", git_dir=git_dir, work_tree=workspace_path) == "2"
+    assert _git(workspace_path, "rev-parse", f"{third['commit']}^", git_dir=git_dir, work_tree=workspace_path) == first["commit"]
+    assert _git(workspace_path, "rev-list", "--count", "refs/delivery-base/main..HEAD", git_dir=git_dir, work_tree=workspace_path) == "2"
     assert _git(workspace_path, "show", f"{third['commit']}:README.md", git_dir=git_dir, work_tree=workspace_path) == "yeni"
     assert _git(workspace_path, "show", f"{first['commit']}:README.md", git_dir=git_dir, work_tree=workspace_path) == "eski"
     assert not os.path.lexists(os.path.join(workspace_path, ".git"))
@@ -452,7 +457,7 @@ def test_concurrent_delivery_keeps_a_single_sha(tmp_path, git_available):
     assert all(item["status"] in {"committed", "reused"} for item in results)
     assert len({item["commit"] for item in results}) == 1
     workspace_path, git_dir = _delivery_paths(str(tmp_path), task_id)
-    assert _git(workspace_path, "rev-list", "--count", "HEAD", git_dir=git_dir, work_tree=workspace_path) == "1"
+    assert _git(workspace_path, "rev-list", "--count", "refs/delivery-base/main..HEAD", git_dir=git_dir, work_tree=workspace_path) == "1"
     assert _git(workspace_path, "rev-parse", "--abbrev-ref", "HEAD", git_dir=git_dir, work_tree=workspace_path) == f"task/{task_id}"
 
 
