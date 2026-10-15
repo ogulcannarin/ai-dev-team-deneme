@@ -51,6 +51,21 @@ class UnavailableExecutionEngine(BaseExecutionEngine):
         )
 
 
+def _requested_engine(preferred: Optional[str]) -> str:
+    """Canlı süreç, açık izin olmadan devralınan mock motorunu kullanmaz."""
+    if preferred:
+        return preferred.strip().lower()
+    requested = os.environ.get("EXECUTION_ENGINE", "docker").strip().lower() or "docker"
+    allowed = os.environ.get("AI_DEV_TEAM_ALLOW_MOCK_ENGINE", "").strip().lower()
+    if requested == "mock" and allowed not in {"1", "true", "yes"}:
+        logger.warning(
+            "[ENGINE_FACTORY] EXECUTION_ENGINE=mock yok sayıldı. "
+            "Canlı görev Docker motorunu kullanır; mock yalnızca AI_DEV_TEAM_ALLOW_MOCK_ENGINE ile açılır."
+        )
+        return "docker"
+    return requested
+
+
 def get_execution_engine(preferred: Optional[str] = None) -> BaseExecutionEngine:
     """
     Ortam yapılandırmasına ve güvenlik politikasına uygun yürütme motorunu döndürür.
@@ -59,7 +74,7 @@ def get_execution_engine(preferred: Optional[str] = None) -> BaseExecutionEngine
         os.environ.get("APP_ENV", "").lower() in ["production", "prod"] or
         os.environ.get("ENVIRONMENT", "").lower() in ["production", "prod"]
     )
-    engine_type = (preferred or os.environ.get("EXECUTION_ENGINE", "docker")).lower()
+    engine_type = _requested_engine(preferred)
 
     if engine_type == "mock":
         logger.info("[ENGINE_FACTORY] Returning MockExecutionEngine (EXECUTION_ENGINE=mock)")

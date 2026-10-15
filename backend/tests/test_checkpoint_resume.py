@@ -180,6 +180,7 @@ def test_new_process_resumes_same_checkpoint(tmp_path):
         "os.environ['DEFAULT_PLANNER_MODE'] = 'deterministic'\n"
         "os.environ['DEFAULT_CODER_MODE'] = 'deterministic'\n"
         "os.environ['EXECUTION_ENGINE'] = 'mock'\n"
+        "os.environ['AI_DEV_TEAM_ALLOW_MOCK_ENGINE'] = '1'\n"
         "os.environ['RUN_LIVE_LLM_TESTS'] = 'false'\n"
         "for _name in ('GITHUB_TOKEN', 'GITHUB_OWNER', 'GITHUB_REPO', "
         "'GITHUB_REPOSITORY', 'GITHUB_API_BASE', 'GITHUB_BASE_BRANCH'):\n"
@@ -207,6 +208,7 @@ def test_new_process_resumes_same_checkpoint(tmp_path):
     child_env["DEFAULT_PLANNER_MODE"] = "deterministic"
     child_env["DEFAULT_CODER_MODE"] = "deterministic"
     child_env["EXECUTION_ENGINE"] = "mock"
+    child_env["AI_DEV_TEAM_ALLOW_MOCK_ENGINE"] = "1"
     child_env["RUN_LIVE_LLM_TESTS"] = "false"
     for name in _GITHUB_ENV:
         child_env[name] = ""

@@ -143,6 +143,7 @@ def test_new_process_recovers_without_rerunning_agents(client, tmp_path):
             "os.environ['AI_DEV_TEAM_DB_PATH'] = sys.argv[1]\n"
             "os.environ['LLM_PROVIDER'] = 'mock'\n"
             "os.environ['EXECUTION_ENGINE'] = 'mock'\n"
+            "os.environ['AI_DEV_TEAM_ALLOW_MOCK_ENGINE'] = '1'\n"
             "import agent_workflow\n"
             "from repository import TaskRepository, WorkflowRunRepository\n"
             "def boom(*_args, **_kwargs):\n"

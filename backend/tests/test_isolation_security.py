@@ -144,6 +144,26 @@ def test_engine_factory_defaults_to_docker_or_unavailable(monkeypatch):
     assert engine.get_isolation_type() == "none"
 
 
+def test_inherited_mock_does_not_replace_docker_engine(monkeypatch):
+    """Canlı süreç devraldığı mock değerini kullanmaz. Seçilen nesne Docker motorunun kendisidir."""
+    monkeypatch.delenv("AI_DEV_TEAM_ALLOW_MOCK_ENGINE", raising=False)
+    monkeypatch.setenv("EXECUTION_ENGINE", "mock")
+    engine = get_execution_engine()
+    assert not isinstance(engine, MockExecutionEngine)
+    assert isinstance(engine, (DockerExecutionEngine, UnavailableExecutionEngine))
+    if isinstance(engine, DockerExecutionEngine):
+        assert engine.default_config.image_name == "ai-dev-team-runner:latest"
+        assert engine.get_isolation_type() == "docker"
+
+
+def test_mock_engine_remains_available_when_tests_opt_in(monkeypatch):
+    monkeypatch.setenv("AI_DEV_TEAM_ALLOW_MOCK_ENGINE", "1")
+    monkeypatch.setenv("EXECUTION_ENGINE", "mock")
+    engine = get_execution_engine()
+    assert isinstance(engine, MockExecutionEngine)
+    assert engine.get_isolation_type() == "mock"
+
+
 def test_mock_engine_success_simulation():
     """MockExecutionEngine başarılı unittest çıktısını doğru formatta simüle eder."""
     engine = MockExecutionEngine()
@@ -337,6 +357,40 @@ def test_docker_engine_read_only_root_live():
         assert res.status == "success"
         assert "WRITE_DENIED" in res.raw_output
         assert "WRITE_SUCCESS" not in res.raw_output
+
+
+@pytest.mark.skipif(not DOCKER_SANDBOX_AVAILABLE, reason="Docker daemon veya sandbox runner imajı hazır değil; canlı sandbox testi atlandı.")
+def test_live_docker_runner_starts_without_network():
+    """Gerçek runner imajı container başlatır, çıktı üretir ve ağı kapalı tutar."""
+    image = subprocess.run(
+        ["docker", "image", "inspect", "ai-dev-team-runner:latest"],
+        capture_output=True,
+        timeout=10,
+    )
+    assert image.returncode == 0
+    engine = get_execution_engine("docker")
+    assert isinstance(engine, DockerExecutionEngine)
+    assert engine.default_config.image_name == "ai-dev-team-runner:latest"
+    script = (
+        "print('DOCKER_OK')\n"
+        "import socket\n"
+        "sock = socket.socket()\n"
+        "sock.settimeout(2)\n"
+        "try:\n"
+        "    sock.connect(('1.1.1.1', 443))\n"
+        "    print('NET_OPEN')\n"
+        "except OSError:\n"
+        "    print('NET_BLOCKED')\n"
+    )
+    with tempfile.TemporaryDirectory() as temp_ws:
+        with open(os.path.join(temp_ws, "probe.py"), "w", encoding="utf-8") as handle:
+            handle.write(script)
+        result = engine.execute_sync(temp_ws, ["python", "probe.py"])
+    assert result.status == "success"
+    assert result.isolation_type == "docker"
+    assert "DOCKER_OK" in result.stdout
+    assert "NET_BLOCKED" in result.stdout
+    assert "NET_OPEN" not in result.stdout
 
 
 @pytest.mark.skipif(not DOCKER_SANDBOX_AVAILABLE, reason="Docker daemon veya sandbox runner imajı hazır değil; canlı sandbox testi atlandı.")
