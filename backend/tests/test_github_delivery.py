@@ -1,6 +1,7 @@
 """GitHub pull request teslimatı. Canlı API ve uzak depo kullanmaz."""
 
 import json
+import os
 import subprocess
 
 import httpx
@@ -296,12 +297,25 @@ def test_github_errors_are_distinct_and_mask_token(mode, error_type, text):
     assert not any(call["method"] == "POST" for call in fake.calls)
 
 
+def _helper_script(command: str):
+    marker = "credential_helper.py"
+    if '"' not in command or marker not in command:
+        return None
+    parts = [part for part in command.split('"') if marker in part]
+    if not parts:
+        return None
+    return parts[0].replace("/", os.sep)
+
+
 def test_git_push_keeps_sha_refspec_and_token_out_of_argv():
     seen = {}
 
     def runner(args, workspace, env):
         seen["args"] = list(args)
         seen["env"] = dict(env)
+        script = _helper_script(env["GIT_CONFIG_VALUE_2"])
+        seen["script"] = script
+        seen["script_text"] = open(script, encoding="utf-8").read()
         return subprocess.CompletedProcess(args, 0, "", "")
 
     git_push_ref(
@@ -325,13 +339,66 @@ def test_git_push_keeps_sha_refspec_and_token_out_of_argv():
     assert "+" not in seen["args"][-1]
     assert seen["env"]["GIT_CONFIG_KEY_0"] == "http.extraheader"
     assert seen["env"]["GIT_CONFIG_VALUE_0"] == f"Authorization: Bearer {TOKEN}"
+    assert seen["env"]["GIT_CONFIG_KEY_1"] == "credential.helper"
     assert seen["env"]["GIT_CONFIG_VALUE_1"] == ""
+    assert seen["env"]["GIT_CONFIG_KEY_2"] == "credential.helper"
+    helper = seen["env"]["GIT_CONFIG_VALUE_2"]
+    assert TOKEN not in helper
+    assert helper.startswith("!f()")
+    assert "credential_helper.py" in helper
+    assert seen["env"]["AI_DEV_TEAM_GIT_PASSWORD"] == TOKEN
+    assert seen["env"]["GCM_INTERACTIVE"] == "Never"
+    assert TOKEN not in seen["script_text"]
+    assert "x-access-token" in seen["script_text"]
     assert "extraheader" not in rendered.lower()
+    assert seen["script"] is not None and not os.path.exists(seen["script"])
+    assert not os.path.exists(os.path.dirname(seen["script"]))
+
+
+def test_git_credential_helper_answers_username_without_a_prompt():
+    seen = {}
+
+    def runner(args, workspace, env):
+        probe = dict(env)
+        probe.pop("GIT_DIR", None)
+        probe.pop("GIT_WORK_TREE", None)
+        seen["result"] = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=example.invalid\n\n",
+            capture_output=True,
+            text=True,
+            env=probe,
+            timeout=20,
+            check=False,
+        )
+        seen["script"] = _helper_script(env["GIT_CONFIG_VALUE_2"])
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    git_push_ref(
+        workspace="unused",
+        git_dir="unused-git",
+        remote_url="https://github.com/acme/widgets.git",
+        refspec=f"refs/heads/task/{TASK_ID}:refs/heads/task/{TASK_ID}",
+        token=TOKEN,
+        runner=runner,
+    )
+    result = seen["result"]
+    assert result.returncode == 0
+    assert TOKEN not in result.stderr
+    assert "terminal prompts disabled" not in result.stderr.lower()
+    assert "username=x-access-token" in result.stdout
+    assert f"password={TOKEN}" in result.stdout
+    assert seen["script"] is not None and not os.path.exists(seen["script"])
 
 
 def test_git_push_error_masks_token_and_rejects_main():
     def runner(args, workspace, env):
-        return subprocess.CompletedProcess(args, 128, "", f"Authentication failed for {TOKEN}")
+        return subprocess.CompletedProcess(
+            args,
+            128,
+            "",
+            f"fatal: could not read Username for 'https://github.com': terminal prompts disabled {TOKEN}",
+        )
 
     with pytest.raises(GitHubAuthError) as caught:
         git_push_ref(

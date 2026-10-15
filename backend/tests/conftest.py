@@ -14,5 +14,6 @@ _GITHUB_ENV = (
 
 @pytest.fixture(autouse=True)
 def isolate_github_credentials(monkeypatch):
+    # Boş değer, load_dotenv(override=False) dosyadan token yüklemesini engeller.
     for name in _GITHUB_ENV:
-        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(name, "")

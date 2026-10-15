@@ -23,6 +23,14 @@ from schemas import ReviewerVerdict, TaskStatus
 
 
 SUPPORTED_TASK = "FastAPI Items CRUD REST API"
+_GITHUB_ENV = (
+    "GITHUB_TOKEN",
+    "GITHUB_OWNER",
+    "GITHUB_REPO",
+    "GITHUB_REPOSITORY",
+    "GITHUB_API_BASE",
+    "GITHUB_BASE_BRANCH",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -173,6 +181,9 @@ def test_new_process_resumes_same_checkpoint(tmp_path):
         "os.environ['DEFAULT_CODER_MODE'] = 'deterministic'\n"
         "os.environ['EXECUTION_ENGINE'] = 'mock'\n"
         "os.environ['RUN_LIVE_LLM_TESTS'] = 'false'\n"
+        "for _name in ('GITHUB_TOKEN', 'GITHUB_OWNER', 'GITHUB_REPO', "
+        "'GITHUB_REPOSITORY', 'GITHUB_API_BASE', 'GITHUB_BASE_BRANCH'):\n"
+        "    os.environ[_name] = ''\n"
         "from agent_workflow import inspect_task_checkpoint, resume_agent_workflow\n"
         "async def main():\n"
         "    task_id = sys.argv[2]\n"
@@ -197,6 +208,8 @@ def test_new_process_resumes_same_checkpoint(tmp_path):
     child_env["DEFAULT_CODER_MODE"] = "deterministic"
     child_env["EXECUTION_ENGINE"] = "mock"
     child_env["RUN_LIVE_LLM_TESTS"] = "false"
+    for name in _GITHUB_ENV:
+        child_env[name] = ""
     completed = subprocess.run(
         [sys.executable, str(script), db_path, "task_ckpt_restart"],
         cwd=backend_dir,

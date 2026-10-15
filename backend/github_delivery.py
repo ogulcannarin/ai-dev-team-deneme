@@ -9,7 +9,10 @@ Token URL'de, Git argümanlarında, olayda ve hata metninde yer almaz.
 
 import os
 import re
+import shutil
 import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 from urllib.parse import urlsplit
@@ -367,6 +370,31 @@ def git_remote_url(config: GitHubConfig) -> str:
     return url
 
 
+_GIT_PASSWORD_ENV = "AI_DEV_TEAM_GIT_PASSWORD"
+_CREDENTIAL_HELPER = """import os
+import sys
+
+action = sys.argv[1] if len(sys.argv) > 1 else "get"
+sys.stdin.read()
+if action != "get":
+    raise SystemExit(0)
+password = os.environ.get("AI_DEV_TEAM_GIT_PASSWORD", "")
+if not password:
+    raise SystemExit(1)
+sys.stdout.write("username=x-access-token\\n")
+sys.stdout.write("password=" + password + "\\n")
+"""
+
+
+def _credential_helper_command(script_path: str) -> str:
+    """Token içermeyen, yalnızca bu push sürecinde çalışan kimlik yardımcısı."""
+    python = os.path.abspath(sys.executable).replace("\\", "/")
+    script = os.path.abspath(script_path).replace("\\", "/")
+    if any(char in value for value in (python, script) for char in "\"'$`\n\r"):
+        raise GitHubAPIError("Git kimlik yardımcısı oluşturulamadı.")
+    return f'!f() {{ "{python}" "{script}" "$1"; }}; f'
+
+
 def git_push_ref(
     *,
     workspace: str,
@@ -378,24 +406,39 @@ def git_push_ref(
 ) -> None:
     """
     Yerel nesneleri aynı SHA ile gönderir.
-    Token yalnızca süreç ortamındaki HTTP başlığındadır.
+    Token URL'de ve git argümanlarında durmaz. Git, kullanıcı adı sorusunu
+    süreç ortamındaki tek kullanımlık kimlik yardımcısıyla yanıtlar.
     """
     branch = refspec.split(":", 1)[0].removeprefix("refs/heads/")
     _assert_push_contract(remote_url, refspec, token, branch, "")
     env = _git_env(workspace, git_dir)
     env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_CONFIG_COUNT"] = "2"
-    env["GIT_CONFIG_KEY_0"] = "http.extraheader"
-    env["GIT_CONFIG_VALUE_0"] = f"Authorization: Bearer {token}"
-    env["GIT_CONFIG_KEY_1"] = "credential.helper"
-    env["GIT_CONFIG_VALUE_1"] = ""
+    env["GCM_INTERACTIVE"] = "Never"
     args = ["push", "--no-force", "--", remote_url, refspec]
     if token and any(token in arg for arg in args):
         raise GitHubAPIError("Git push oluşturulmadı.")
+    helper_dir = tempfile.mkdtemp(prefix="aidev-git-auth-")
     try:
-        completed = (runner or _run_git)(args, workspace, env)
-    except subprocess.TimeoutExpired:
-        raise GitHubNetworkError("Git push zaman aşımına uğradı.") from None
+        script_path = os.path.join(helper_dir, "credential_helper.py")
+        with open(script_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(_CREDENTIAL_HELPER)
+        helper = _credential_helper_command(script_path)
+        if token and token in helper:
+            raise GitHubAPIError("Git push oluşturulmadı.")
+        env["GIT_CONFIG_COUNT"] = "3"
+        env["GIT_CONFIG_KEY_0"] = "http.extraheader"
+        env["GIT_CONFIG_VALUE_0"] = f"Authorization: Bearer {token}"
+        env["GIT_CONFIG_KEY_1"] = "credential.helper"
+        env["GIT_CONFIG_VALUE_1"] = ""
+        env["GIT_CONFIG_KEY_2"] = "credential.helper"
+        env["GIT_CONFIG_VALUE_2"] = helper
+        env[_GIT_PASSWORD_ENV] = token
+        try:
+            completed = (runner or _run_git)(args, workspace, env)
+        except subprocess.TimeoutExpired:
+            raise GitHubNetworkError("Git push zaman aşımına uğradı.") from None
+    finally:
+        shutil.rmtree(helper_dir, ignore_errors=True)
     if completed.returncode == 0:
         return
     detail = mask_secrets((completed.stderr or completed.stdout or "").strip(), token)
