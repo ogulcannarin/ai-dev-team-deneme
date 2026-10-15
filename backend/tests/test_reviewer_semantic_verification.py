@@ -24,7 +24,9 @@ from schemas import (
 )
 from agent_workflow import (
     _execute_reviewer_in_workspace,
+    _generate_deterministic_code_files,
     _perform_semantic_verification,
+    _route_after_reviewer,
 )
 
 
@@ -387,3 +389,189 @@ def test_semantic_s7_semantic_layer_exception_failsafe():
     assert any(f.category == "semantic_alignment" for f in findings)
     assert any(f.severity == FindingSeverity.HIGH for f in findings)
     assert any(e.status == CriterionStatus.UNCERTAIN for e in evals)
+
+
+_CALC_README_REQUEST = (
+    "Python hesaplama modülü oluştur. calculator.py içinde add(a, b) yaz. "
+    "README.md kısa bir kullanım örneği ve beklenen çıktıyı içersin."
+)
+_CALC_CODE = '''"""Hesaplama Modulu"""
+def add(a: int, b: int) -> int:
+    """Iki sayiyi toplar."""
+    return a + b
+'''
+_README_WITH_EXAMPLE = """# Hesaplama Modulu
+```python
+from calculator import add
+
+result = add(2, 3)
+print(result)
+```
+Beklenen çıktı:
+
+```text
+5
+```
+"""
+_TESTER_OK = {
+    "status": "tested",
+    "passed": 6,
+    "failed": 0,
+    "summary": "Ran 6 tests. OK.",
+}
+
+
+def _readme_evaluation(result):
+    matches = [
+        item for item in result.semantic_evaluations
+        if item.criterion == "README kullanım örneği ve beklenen çıktı"
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def test_readme_example_missing_is_not_met_and_not_approved():
+    """Kullanım örneği veya beklenen çıktı eksikse kriter karşılanmaz ve onay verilmez."""
+    task_id = f"task_readme_missing_{uuid.uuid4().hex[:6]}"
+    with tempfile.TemporaryDirectory() as tmp_workspaces:
+        _setup_workspace(tmp_workspaces, task_id, {
+            "calculator.py": _CALC_CODE,
+            "README.md": "# Hesaplama Modulu\nfrom calculator import add\nresult = add(2, 3)\n",
+        })
+        result = _execute_reviewer_in_workspace(
+            task_id=task_id,
+            description=_CALC_README_REQUEST,
+            coder_data={"status": "coded", "created_files": [f"workspaces/{task_id}/calculator.py"]},
+            tester_data=_TESTER_OK,
+            workspaces_root=tmp_workspaces,
+        )
+    evaluation = _readme_evaluation(result)
+    assert evaluation.status == CriterionStatus.NOT_MET
+    assert result.verdict == ReviewerVerdict.CHANGES_REQUESTED
+    assert any(finding.severity == FindingSeverity.HIGH for finding in result.findings)
+
+
+def test_readme_example_present_is_met_and_approved():
+    """Örnek ve beklenen çıktı varsa kriter karşılanır ve diğer koşullar uygunsa onay verilir."""
+    task_id = f"task_readme_ok_{uuid.uuid4().hex[:6]}"
+    with tempfile.TemporaryDirectory() as tmp_workspaces:
+        _setup_workspace(tmp_workspaces, task_id, {
+            "calculator.py": _CALC_CODE,
+            "README.md": _README_WITH_EXAMPLE,
+        })
+        result = _execute_reviewer_in_workspace(
+            task_id=task_id,
+            description=_CALC_README_REQUEST,
+            coder_data={"status": "coded", "created_files": ["calculator.py", "README.md"]},
+            tester_data=_TESTER_OK,
+            workspaces_root=tmp_workspaces,
+        )
+    evaluation = _readme_evaluation(result)
+    assert evaluation.status == CriterionStatus.MET
+    assert result.verdict == ReviewerVerdict.APPROVED
+
+
+def test_changes_requested_does_not_route_to_delivery():
+    """Değişiklik talebi teslimat düğümüne gitmez."""
+    state = {
+        "status": "reviewed",
+        "require_human_approval": False,
+        "reviewer": {"verdict": "changes_requested"},
+        "tester": {"status": "tested", "passed": 6, "failed": 0},
+        "retry_count": 0,
+        "max_retries": 2,
+    }
+    assert _route_after_reviewer(state) != "delivery"
+    state["retry_count"] = 2
+    assert _route_after_reviewer(state) == "end"
+
+
+def test_task_without_readme_requirement_keeps_approval():
+    """README örneği istemeyen hesaplama görevi önceki onay davranışını korur."""
+    task_id = f"task_readme_optional_{uuid.uuid4().hex[:6]}"
+    description = "Python ile iki sayıyı toplayan add ve çıkaran subtract fonksiyonlarını içeren bir hesaplama modülü yaz."
+    code = _CALC_CODE + "\ndef subtract(a: int, b: int) -> int:\n    return a - b\n"
+    with tempfile.TemporaryDirectory() as tmp_workspaces:
+        _setup_workspace(tmp_workspaces, task_id, {
+            "calculator.py": code,
+            "README.md": "# Calculator Module\n",
+        })
+        result = _execute_reviewer_in_workspace(
+            task_id=task_id,
+            description=description,
+            coder_data={"status": "coded", "created_files": ["calculator.py", "README.md"]},
+            tester_data=_TESTER_OK,
+            workspaces_root=tmp_workspaces,
+        )
+    assert result.verdict == ReviewerVerdict.APPROVED
+    assert all(item.criterion != "README kullanım örneği ve beklenen çıktı" for item in result.semantic_evaluations)
+    assert all(item.status == CriterionStatus.MET for item in result.semantic_evaluations)
+
+
+def test_missing_or_unreadable_readme_is_not_approved(monkeypatch):
+    """İstenen README yoksa veya okunamazsa onay üretilmez."""
+    task_id = f"task_readme_absent_{uuid.uuid4().hex[:6]}"
+    with tempfile.TemporaryDirectory() as tmp_workspaces:
+        _setup_workspace(tmp_workspaces, task_id, {"calculator.py": _CALC_CODE})
+        missing = _execute_reviewer_in_workspace(
+            task_id=task_id,
+            description=_CALC_README_REQUEST,
+            coder_data={"status": "coded", "created_files": ["calculator.py"]},
+            tester_data=_TESTER_OK,
+            workspaces_root=tmp_workspaces,
+        )
+    assert _readme_evaluation(missing).status == CriterionStatus.NOT_MET
+    assert missing.verdict != ReviewerVerdict.APPROVED
+
+    task_id = f"task_readme_unreadable_{uuid.uuid4().hex[:6]}"
+    with tempfile.TemporaryDirectory() as tmp_workspaces:
+        _setup_workspace(tmp_workspaces, task_id, {
+            "calculator.py": _CALC_CODE,
+            "README.md": _README_WITH_EXAMPLE,
+        })
+        monkeypatch.setattr(
+            "agent_workflow._read_task_readme",
+            lambda _workspace: (None, "README.md okunamadı."),
+        )
+        unreadable = _execute_reviewer_in_workspace(
+            task_id=task_id,
+            description=_CALC_README_REQUEST,
+            coder_data={"status": "coded", "created_files": ["calculator.py", "README.md"]},
+            tester_data=_TESTER_OK,
+            workspaces_root=tmp_workspaces,
+        )
+    assert _readme_evaluation(unreadable).status == CriterionStatus.NOT_MET
+    assert unreadable.verdict != ReviewerVerdict.APPROVED
+
+
+def test_uncertain_readme_contract_is_not_marked_met():
+    """Belirli sözleşmesi olmayan README kriteri MET sayılmaz; diğer MET kriterler mevcut kuralı bozmaz."""
+    task_id = f"task_readme_uncertain_{uuid.uuid4().hex[:6]}"
+    description = "Servis belgesi için README içinde bir kullanım örneği bulunsun."
+    code = 'def get_status() -> str:\n    """Durum."""\n    return "ok"\n'
+    with tempfile.TemporaryDirectory() as tmp_workspaces:
+        _setup_workspace(tmp_workspaces, task_id, {
+            "service.py": code,
+            "README.md": "# Servis\n",
+        })
+        result = _execute_reviewer_in_workspace(
+            task_id=task_id,
+            description=description,
+            coder_data={"status": "coded", "created_files": ["service.py", "README.md"]},
+            tester_data=_TESTER_OK,
+            workspaces_root=tmp_workspaces,
+        )
+    evaluation = _readme_evaluation(result)
+    assert evaluation.status == CriterionStatus.UNCERTAIN
+    assert evaluation.status != CriterionStatus.MET
+    assert any(item.status == CriterionStatus.MET for item in result.semantic_evaluations)
+    assert result.verdict == ReviewerVerdict.APPROVED
+
+
+def test_deterministic_calculator_readme_includes_usage_example():
+    """Retry aynı hesaplama şablonunu üretse de kullanım örneği ve beklenen çıktı bulunur."""
+    files = _generate_deterministic_code_files("task_readme_template", _CALC_README_REQUEST)
+    readme = files["README.md"]
+    compact = "".join(readme.split())
+    assert "add(2,3)" in compact
+    assert "\n5\n" in f"\n{readme}\n"

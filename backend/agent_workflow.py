@@ -778,6 +778,21 @@ def divide(a: Number, b: Number) -> float:
 Bu izole calisma alani Coder Agent tarafindan olusturulmustur.
 - **Modul**: `calculator.py`
 - **Tanim**: Tip guvenli temel aritmetik islemler (toplama, cikarma, carpma, bolme) ve test destegi.
+
+## Kullanim
+
+```python
+from calculator import add
+
+result = add(2, 3)
+print(result)
+```
+
+Beklenen çıktı:
+
+```text
+5
+```
 """
 
     else:
@@ -2438,6 +2453,62 @@ def tester_node(state: AgentWorkflowState) -> AgentWorkflowState:
 
 # --- Reviewer Semantic Verification Layer ---
 
+_README_EXAMPLE_CRITERION = "README kullanım örneği ve beklenen çıktı"
+
+
+def _description_requests_readme_example(description: str) -> bool:
+    """Açıklama README içinde kullanım örneği veya beklenen çıktı istiyor mu."""
+    lower = description.lower()
+    phrases = (
+        "kullanım örneği",
+        "kullanim ornegi",
+        "usage example",
+        "beklenen çıktı",
+        "beklenen cikti",
+        "beklenen çıktıyı",
+        "beklenen ciktiyi",
+        "expected output",
+    )
+    if any(phrase in lower for phrase in phrases):
+        return True
+    return "readme" in lower and any(
+        token in lower for token in ("örnek", "ornek", "example", "çıktı", "cikti", "output")
+    )
+
+
+def _is_calculator_readme_contract(description: str) -> bool:
+    """Hesaplama görevi README'de add(2, 3) örneğini ve 5 çıktısını gerektiriyor mu."""
+    lower = description.lower()
+    calculator = any(
+        token in lower
+        for token in ("hesapla", "calculator", "hesaplama", "topla", "aritmetik", "add")
+    )
+    return calculator and _description_requests_readme_example(description)
+
+
+def _read_task_readme(target_workspace: str) -> Tuple[Optional[str], Optional[str]]:
+    """README.md metnini okur. Dosya yoksa veya okunamazsa başarı döndürmez."""
+    path = os.path.join(target_workspace, "README.md")
+    if os.path.islink(path) or not os.path.isfile(path):
+        return None, "README.md bulunamadı."
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read(), None
+    except OSError:
+        return None, "README.md okunamadı."
+
+
+def _readme_has_calculator_example(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    has_call = "add(2,3)" in compact
+    has_output = re.search(r"(?m)^\s*5\s*$", text) is not None or re.search(
+        r"(beklenen|çıktı|cikti|output).{0,40}\b5\b",
+        text,
+        re.IGNORECASE,
+    ) is not None
+    return has_call and has_output
+
+
 def _perform_semantic_verification(
     task_id: str,
     description: str,
@@ -2618,6 +2689,25 @@ def _perform_semantic_verification(
                             evidence="Tip tanımları veya veri modelleri bulunamadı.",
                             confidence=0.8
                         ))
+                elif "işlevsel gereksinim" in crit_lower or "functional requirement" in crit_lower:
+                    matched = [
+                        name for name in sorted(functions_defined)
+                        if re.search(rf"\b{re.escape(name)}\b", description, re.IGNORECASE)
+                    ]
+                    if matched:
+                        evaluations.append(CriterionEvaluation(
+                            criterion=crit,
+                            status=CriterionStatus.MET,
+                            evidence=f"Açıklamada adı geçen işlevler kodda tanımlı: {', '.join(matched)}",
+                            confidence=0.9
+                        ))
+                    else:
+                        evaluations.append(CriterionEvaluation(
+                            criterion=crit,
+                            status=CriterionStatus.UNCERTAIN,
+                            evidence="İşlevsel gereksinim, açıklamadaki bir işlev adıyla eşleşen fonksiyona bağlanamadı.",
+                            confidence=0.6
+                        ))
                 elif "422" in crit or "201" in crit or "401" in crit or "429" in crit:
                     expected_code = next((code for code in ["422", "201", "401", "429"] if code in crit), "")
                     if expected_code in all_code_combined or (tester_data and expected_code in str(tester_data)):
@@ -2649,6 +2739,45 @@ def _perform_semantic_verification(
                             evidence="İşlevsel yapı tespit edilemedi.",
                             confidence=0.6
                         ))
+
+        if _description_requests_readme_example(description) and not has_semantic_mismatch and not is_ambiguous_task:
+            readme_text, readme_error = _read_task_readme(target_workspace)
+            if _is_calculator_readme_contract(description):
+                if readme_error or readme_text is None:
+                    evaluations.append(CriterionEvaluation(
+                        criterion=_README_EXAMPLE_CRITERION,
+                        status=CriterionStatus.NOT_MET,
+                        evidence=readme_error or "README.md okunamadı.",
+                        confidence=0.95
+                    ))
+                elif _readme_has_calculator_example(readme_text):
+                    evaluations.append(CriterionEvaluation(
+                        criterion=_README_EXAMPLE_CRITERION,
+                        status=CriterionStatus.MET,
+                        evidence="README.md add(2, 3) kullanım örneğini ve beklenen 5 çıktısını içeriyor.",
+                        confidence=0.95
+                    ))
+                else:
+                    evaluations.append(CriterionEvaluation(
+                        criterion=_README_EXAMPLE_CRITERION,
+                        status=CriterionStatus.NOT_MET,
+                        evidence="README.md add(2, 3) örneğini veya beklenen 5 çıktısını içermiyor.",
+                        confidence=0.95
+                    ))
+            elif readme_error or readme_text is None:
+                evaluations.append(CriterionEvaluation(
+                    criterion=_README_EXAMPLE_CRITERION,
+                    status=CriterionStatus.NOT_MET,
+                    evidence=readme_error or "README.md okunamadı.",
+                    confidence=0.9
+                ))
+            else:
+                evaluations.append(CriterionEvaluation(
+                    criterion=_README_EXAMPLE_CRITERION,
+                    status=CriterionStatus.UNCERTAIN,
+                    evidence="README.md okundu. Belirli bir kullanım örneği sözleşmesi doğrulanamadı.",
+                    confidence=0.5
+                ))
 
         # 6. Bulguları (Findings) Oluştur
         if has_semantic_mismatch:
