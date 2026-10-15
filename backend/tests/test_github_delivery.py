@@ -1,8 +1,11 @@
 """GitHub pull request teslimatı. Canlı API ve uzak depo kullanmaz."""
 
+import base64
 import json
 import os
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
@@ -313,7 +316,7 @@ def test_git_push_keeps_sha_refspec_and_token_out_of_argv():
     def runner(args, workspace, env):
         seen["args"] = list(args)
         seen["env"] = dict(env)
-        script = _helper_script(env["GIT_CONFIG_VALUE_2"])
+        script = _helper_script(env["GIT_CONFIG_VALUE_1"])
         seen["script"] = script
         seen["script_text"] = open(script, encoding="utf-8").read()
         return subprocess.CompletedProcess(args, 0, "", "")
@@ -337,12 +340,20 @@ def test_git_push_keeps_sha_refspec_and_token_out_of_argv():
     assert TOKEN not in rendered
     assert "main" not in rendered
     assert "+" not in seen["args"][-1]
-    assert seen["env"]["GIT_CONFIG_KEY_0"] == "http.extraheader"
-    assert seen["env"]["GIT_CONFIG_VALUE_0"] == f"Authorization: Bearer {TOKEN}"
+    assert seen["env"]["GIT_CONFIG_COUNT"] == "2"
+    assert seen["env"]["GIT_CONFIG_KEY_0"] == "credential.helper"
+    assert seen["env"]["GIT_CONFIG_VALUE_0"] == ""
     assert seen["env"]["GIT_CONFIG_KEY_1"] == "credential.helper"
-    assert seen["env"]["GIT_CONFIG_VALUE_1"] == ""
-    assert seen["env"]["GIT_CONFIG_KEY_2"] == "credential.helper"
-    helper = seen["env"]["GIT_CONFIG_VALUE_2"]
+    config_text = " ".join(
+        f"{key}={value}"
+        for key, value in seen["env"].items()
+        if key.startswith("GIT_CONFIG_")
+    )
+    assert "extraheader" not in config_text.lower()
+    assert "authorization" not in config_text.lower()
+    assert "bearer" not in config_text.lower()
+    assert TOKEN not in config_text
+    helper = seen["env"]["GIT_CONFIG_VALUE_1"]
     assert TOKEN not in helper
     assert helper.startswith("!f()")
     assert "credential_helper.py" in helper
@@ -371,7 +382,7 @@ def test_git_credential_helper_answers_username_without_a_prompt():
             timeout=20,
             check=False,
         )
-        seen["script"] = _helper_script(env["GIT_CONFIG_VALUE_2"])
+        seen["script"] = _helper_script(env["GIT_CONFIG_VALUE_1"])
         return subprocess.CompletedProcess(args, 0, "", "")
 
     git_push_ref(
@@ -389,6 +400,68 @@ def test_git_credential_helper_answers_username_without_a_prompt():
     assert "username=x-access-token" in result.stdout
     assert f"password={TOKEN}" in result.stdout
     assert seen["script"] is not None and not os.path.exists(seen["script"])
+
+
+def test_git_push_env_sends_basic_without_bearer():
+    records = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            auths = self.headers.get_all("Authorization") or []
+            schemes = []
+            basic_ok = False
+            for value in auths:
+                scheme, _, rest = value.partition(" ")
+                schemes.append(scheme)
+                if scheme.lower() != "basic" or not rest:
+                    continue
+                decoded = base64.b64decode(rest).decode("utf-8", errors="replace")
+                user, _, password = decoded.partition(":")
+                basic_ok = user == "x-access-token" and password == TOKEN
+            records.append({"schemes": schemes, "basic_ok": basic_ok})
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="GitHub"')
+            self.end_headers()
+
+        def log_message(self, fmt, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    try:
+        def runner(args, workspace, env):
+            probe = dict(env)
+            probe.pop("GIT_DIR", None)
+            probe.pop("GIT_WORK_TREE", None)
+            completed = subprocess.run(
+                ["git", "ls-remote", f"http://127.0.0.1:{port}/acme/widgets.git"],
+                cwd=os.environ.get("TEMP") or os.environ.get("TMP"),
+                env=probe,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            assert TOKEN not in completed.stderr
+            assert TOKEN not in completed.stdout
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        git_push_ref(
+            workspace="unused",
+            git_dir="unused-git",
+            remote_url="https://github.com/acme/widgets.git",
+            refspec=f"refs/heads/task/{TASK_ID}:refs/heads/task/{TASK_ID}",
+            token=TOKEN,
+            runner=runner,
+        )
+    finally:
+        server.shutdown()
+
+    assert records
+    assert all("Bearer" not in record["schemes"] for record in records)
+    assert any(record["basic_ok"] for record in records)
 
 
 def test_git_push_error_masks_token_and_rejects_main():

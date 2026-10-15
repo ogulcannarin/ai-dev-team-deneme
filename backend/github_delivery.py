@@ -406,8 +406,9 @@ def git_push_ref(
 ) -> None:
     """
     Yerel nesneleri aynı SHA ile gönderir.
-    Token URL'de ve git argümanlarında durmaz. Git, kullanıcı adı sorusunu
-    süreç ortamındaki tek kullanımlık kimlik yardımcısıyla yanıtlar.
+    Token URL'de ve git argümanlarında durmaz. Bu sürecin Git yapılandırması
+    Authorization başlığı eklemez; Git, Basic kimliği tek kullanımlık
+    yardımcının süreç ortamındaki parolasıyla üretir.
     """
     branch = refspec.split(":", 1)[0].removeprefix("refs/heads/")
     _assert_push_contract(remote_url, refspec, token, branch, "")
@@ -425,13 +426,11 @@ def git_push_ref(
         helper = _credential_helper_command(script_path)
         if token and token in helper:
             raise GitHubAPIError("Git push oluşturulmadı.")
-        env["GIT_CONFIG_COUNT"] = "3"
-        env["GIT_CONFIG_KEY_0"] = "http.extraheader"
-        env["GIT_CONFIG_VALUE_0"] = f"Authorization: Bearer {token}"
+        env["GIT_CONFIG_COUNT"] = "2"
+        env["GIT_CONFIG_KEY_0"] = "credential.helper"
+        env["GIT_CONFIG_VALUE_0"] = ""
         env["GIT_CONFIG_KEY_1"] = "credential.helper"
-        env["GIT_CONFIG_VALUE_1"] = ""
-        env["GIT_CONFIG_KEY_2"] = "credential.helper"
-        env["GIT_CONFIG_VALUE_2"] = helper
+        env["GIT_CONFIG_VALUE_1"] = helper
         env[_GIT_PASSWORD_ENV] = token
         try:
             completed = (runner or _run_git)(args, workspace, env)
