@@ -310,17 +310,27 @@ def _verified_commit(workspace: str, env: Dict[str, str], ref: str) -> Optional[
     return sha
 
 
-def _source_commit(source_git: str, branch: str) -> Optional[str]:
+def _base_ref_candidates(branch: str) -> tuple[str, ...]:
+    """Taban dalın adını taşıyan ref'ler. Detached HEAD bu listeye girmez."""
+    return (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}")
+
+
+def _resolve_source_commit(source_git: str, branch: str) -> Optional[tuple[str, str]]:
+    """Aday ref commit nesnesine çözülürse (ref, sha) döner. HEAD tek başına kabul edilmez."""
     env = _source_env(source_git)
-    probe = _run_git(
-        ["rev-parse", "--verify", "--end-of-options", f"refs/heads/{branch}"],
-        source_git,
-        env,
+    for ref in _base_ref_candidates(branch):
+        sha = _verified_commit(source_git, env, ref)
+        if sha:
+            return ref, sha
+    return None
+
+
+def _unverified_base_reason(branch: str) -> str:
+    refs = ", ".join(_base_ref_candidates(branch))
+    return (
+        f"Ana dal ref'i doğrulanamadı ({refs}). "
+        "Detached HEAD taban kabul edilmedi. Commit oluşturulmadı."
     )
-    sha = probe.stdout.strip()
-    if probe.returncode != 0 or len(sha) != 40 or not _sha_ok(sha):
-        return None
-    return sha
 
 
 def _source_is_shallow(source_git: str) -> bool:
@@ -397,7 +407,9 @@ def _record_shallow_boundaries(source_git: str, git_dir: str, workspace: str, en
             handle.write(sha + "\n")
 
 
-def _import_base_commit(workspace: str, env: Dict[str, str], source_git: str, git_dir: str) -> Optional[str]:
+def _import_base_commit(
+    workspace: str, env: Dict[str, str], source_git: str, git_dir: str
+) -> tuple[Optional[str], Optional[str]]:
     """Ana dal nesnelerini teslimat deposuna kopyalar. Kaynak depoyu ve ana dalı değiştirmez."""
     source = os.path.abspath(source_git)
     if (
@@ -406,34 +418,35 @@ def _import_base_commit(workspace: str, env: Dict[str, str], source_git: str, gi
         or source.startswith(("http://", "https://"))
         or "@" in source
     ):
-        return None
+        return None, None
     branch = _base_branch_name()
     destination = _base_ref(branch)
-    expected = _source_commit(source, branch)
-    if expected is None:
-        return None
+    resolved = _resolve_source_commit(source, branch)
+    if resolved is None:
+        return None, _unverified_base_reason(branch)
+    source_ref, expected = resolved
     _run_git(
-        ["fetch", "--no-tags", "--", source, f"refs/heads/{branch}:{destination}"],
+        ["fetch", "--no-tags", "--", source, f"{source_ref}:{destination}"],
         workspace,
         env,
     )
     # Çıkış kodu 0 olsa bile ref beklenen commit'e işaret etmiyorsa fetch başarılı sayılmaz.
     imported = _verified_commit(workspace, env, destination)
     if imported == expected:
-        return expected
+        return expected, None
     if not _source_is_shallow(source):
-        return None
+        return None, None
     if not _copy_shallow_objects(source, workspace, env, expected):
-        return None
+        return None, None
     _record_shallow_boundaries(source, git_dir, workspace, env)
     if imported is not None and not _is_ancestor(workspace, env, imported, expected):
-        return None
+        return None, None
     previous = imported if imported is not None else "0" * 40
     _run_git(["update-ref", destination, expected, previous], workspace, env)
     verified = _verified_commit(workspace, env, destination)
     if verified != expected:
-        return None
-    return expected
+        return None, None
+    return expected, None
 
 
 def _is_ancestor(workspace: str, env: Dict[str, str], base_sha: str, commit_sha: str) -> bool:
@@ -535,9 +548,14 @@ def _deliver_locked(task_id: str, workspace: str, git_dir: str, branch: str, nam
     if toplevel.returncode != 0 or actual_root != os.path.normcase(workspace):
         return _result("failed", branch=branch, files=names, reason="Git kökü çalışma alanıyla eşleşmiyor. Teslimat durduruldu.")
 
-    base_sha = _import_base_commit(workspace, env, source_git, git_dir)
+    base_sha, base_reason = _import_base_commit(workspace, env, source_git, git_dir)
     if not base_sha:
-        return _result("failed", branch=branch, files=names, reason="Ana dal geçmişi teslimat deposuna alınamadı. Commit oluşturulmadı.")
+        return _result(
+            "failed",
+            branch=branch,
+            files=names,
+            reason=base_reason or "Ana dal geçmişi teslimat deposuna alınamadı. Commit oluşturulmadı.",
+        )
 
     existing = _existing_commit(workspace, branch, env)
     if existing and not _is_ancestor(workspace, env, base_sha, existing):

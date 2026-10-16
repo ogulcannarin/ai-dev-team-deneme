@@ -25,7 +25,7 @@ from agent_workflow import (
     _route_after_reviewer,
 )
 from database import init_db
-from git_delivery import deliver_task_workspace
+from git_delivery import _find_base_git_dir, deliver_task_workspace
 from main import app
 from repository import TaskRepository
 from schemas import ReviewerVerdict, TaskStatus
@@ -753,3 +753,110 @@ def test_shallow_repeated_and_concurrent_delivery_keep_one_history(tmp_path, git
     repeated = deliver_task_workspace(task_id, str(root), ["README.md"])
     assert repeated["status"] == "reused"
     assert repeated["commit"] == results[0]["commit"]
+
+
+def _git_result(cwd: str, *args: str) -> subprocess.CompletedProcess:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_detached_shallow_checkout_without_local_main_uses_verified_origin_ref(tmp_path, git_available):
+    source = tmp_path / "full-source"
+    source.mkdir()
+    _git(str(source), "init", "-b", "main")
+    _commit_file(str(source), "user.txt", "bir\n", "ilk")
+    tip = _commit_file(str(source), "user.txt", "iki\n", "ikinci")
+    checkout = tmp_path / "shallow-checkout"
+    _shallow_clone(str(source), str(checkout))
+    _git(str(checkout), "checkout", "--detach", "HEAD")
+    _git(str(checkout), "update-ref", "-d", "refs/heads/main")
+
+    missing_main = _git_result(str(checkout), "rev-parse", "--verify", "--end-of-options", "refs/heads/main")
+    detached = _git_result(str(checkout), "symbolic-ref", "--quiet", "HEAD")
+    assert missing_main.returncode != 0
+    assert detached.returncode != 0
+    assert _git(str(checkout), "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    assert _git(str(checkout), "rev-parse", "--is-shallow-repository") == "true"
+    assert _git(str(checkout), "rev-list", "--count", "HEAD") == "1"
+    origin_main = _git(str(checkout), "rev-parse", "--verify", "refs/remotes/origin/main")
+    assert origin_main == tip
+    assert _git(str(checkout), "cat-file", "-t", origin_main) == "commit"
+
+    root = checkout / "workspaces"
+    task_id = "task_detached"
+    workspace = root / task_id
+    workspace.mkdir(parents=True)
+    found = _find_base_git_dir(str(workspace))
+    project_git = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".git"))
+    assert os.path.normcase(found or "") == os.path.normcase(str(checkout / ".git"))
+    assert os.path.normcase(found or "") != os.path.normcase(project_git)
+
+    readme = workspace / "README.md"
+    readme.write_text("eski\n", encoding="utf-8")
+    first = deliver_task_workspace(task_id, str(root), ["README.md"])
+    second = deliver_task_workspace(task_id, str(root), ["README.md"])
+    assert first["status"] == "committed"
+    assert first["commit"]
+    assert second["status"] == "reused"
+    assert second["commit"] == first["commit"]
+
+    readme.write_text("yeni\n", encoding="utf-8")
+    third = deliver_task_workspace(task_id, str(root), ["README.md"])
+    assert third["status"] == "committed"
+    assert third["commit"] != first["commit"]
+    assert third["previous_commit"] == first["commit"]
+    workspace_path, git_dir = _delivery_paths(str(root), task_id)
+    assert _git(workspace_path, "rev-parse", "refs/delivery-base/main", git_dir=git_dir, work_tree=workspace_path) == tip
+    assert _git(workspace_path, "rev-parse", f"{third['commit']}^", git_dir=git_dir, work_tree=workspace_path) == first["commit"]
+
+    parallel_id = "task_detached_parallel"
+    parallel = root / parallel_id
+    parallel.mkdir()
+    (parallel / "README.md").write_text("ortak\n", encoding="utf-8")
+    barrier = threading.Barrier(2)
+    results = []
+
+    def _worker():
+        barrier.wait(timeout=10)
+        results.append(deliver_task_workspace(parallel_id, str(root), ["README.md"]))
+
+    threads = [threading.Thread(target=_worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert len(results) == 2
+    assert all(item["status"] in {"committed", "reused"} for item in results)
+    assert len({item["commit"] for item in results}) == 1
+    parallel_workspace, parallel_git = _delivery_paths(str(root), parallel_id)
+    assert _git(
+        parallel_workspace,
+        "rev-parse",
+        "refs/delivery-base/main",
+        git_dir=parallel_git,
+        work_tree=parallel_workspace,
+    ) == tip
+
+    _git(str(checkout), "update-ref", "-d", "refs/remotes/origin/main")
+    still_missing = _git_result(str(checkout), "rev-parse", "--verify", "--end-of-options", "refs/heads/main")
+    remote_missing = _git_result(str(checkout), "rev-parse", "--verify", "--end-of-options", "refs/remotes/origin/main")
+    assert still_missing.returncode != 0
+    assert remote_missing.returncode != 0
+    assert _git(str(checkout), "rev-parse", "HEAD") == tip
+    ambiguous = root / "task_ambiguous"
+    ambiguous.mkdir()
+    (ambiguous / "README.md").write_text("belirsiz\n", encoding="utf-8")
+    refused = deliver_task_workspace("task_ambiguous", str(root), ["README.md"])
+    assert refused["status"] == "failed"
+    assert refused["commit"] is None
+    assert "Detached HEAD taban kabul edilmedi" in str(refused["reason"])
+    assert "refs/heads/main" in str(refused["reason"])
+    assert "refs/remotes/origin/main" in str(refused["reason"])
+    assert _git_result(str(checkout), "rev-parse", "--verify", "--end-of-options", "refs/heads/main").returncode != 0
