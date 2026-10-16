@@ -359,7 +359,117 @@ def test_docker_engine_check_availability_when_daemon_fails(monkeypatch):
     is_ok, diag = engine.check_availability()
     assert is_ok is False
     assert "Docker daemon yanıt vermiyor" in diag
+    assert "exit=1" in diag
     assert "docker daemon is not running" in diag
+
+
+def _patch_docker_cli(monkeypatch, runner):
+    """Sağlık kontrolünü gerçek daemon yerine verilen subprocess davranışına bağlar."""
+    monkeypatch.setattr(shutil, "which", lambda cmd: r"C:\mock\docker.exe")
+    monkeypatch.setattr(subprocess, "run", runner)
+    monkeypatch.setenv("EXECUTION_ENGINE", "docker")
+    monkeypatch.delenv("ALLOW_UNSAFE_HOST_EXECUTION", raising=False)
+
+
+def test_factory_single_successful_probe_selects_docker(monkeypatch):
+    """Başarılı sağlık kontrolü tek probda Docker motorunu seçer."""
+    calls = {"n": 0}
+
+    def fake_run(*args, **kwargs):
+        calls["n"] += 1
+
+        class Proc:
+            returncode = 0
+            stdout = "29.6.1\n"
+            stderr = ""
+
+        return Proc()
+
+    _patch_docker_cli(monkeypatch, fake_run)
+    engine = get_execution_engine("docker")
+
+    assert calls["n"] == 1
+    assert isinstance(engine, DockerExecutionEngine)
+    assert engine.last_availability == (True, "Docker daemon aktif (Versiyon: 29.6.1)")
+    assert engine.get_isolation_type() == "docker"
+
+
+def test_factory_cli_error_is_recorded_once_and_blocks_host_execution(monkeypatch):
+    """İlk CLI hatası kaydedilir. Sonraki prob başarılı olsa bile unavailable seçilmez."""
+    calls = {"n": 0}
+
+    def fake_run(*args, **kwargs):
+        calls["n"] += 1
+
+        class Proc:
+            pass
+
+        proc = Proc()
+        if calls["n"] == 1:
+            proc.returncode = 1
+            proc.stdout = ""
+            proc.stderr = "error during connect: This error may indicate that the docker daemon is not running."
+        else:
+            proc.returncode = 0
+            proc.stdout = "29.6.1\n"
+            proc.stderr = ""
+        return proc
+
+    _patch_docker_cli(monkeypatch, fake_run)
+    engine = get_execution_engine("docker")
+
+    assert calls["n"] == 1
+    assert isinstance(engine, UnavailableExecutionEngine)
+    assert engine.is_available() is False
+    assert engine.get_isolation_type() == "none"
+    assert "exit=1" in engine.reason
+    assert "docker daemon is not running" in engine.reason
+    assert "29.6.1" not in engine.reason
+    assert "Docker daemon aktif" not in engine.reason
+
+    blocked = engine.execute_sync(r"C:\unused", ["python", "-m", "unittest"])
+    assert blocked.status == "blocked"
+    assert blocked.isolation_type == "none"
+    assert calls["n"] == 1
+
+
+def test_factory_timeout_records_exception_type_without_second_probe(monkeypatch):
+    """Zaman aşımı exception türüyle kaydedilir ve ikinci sağlık kontrolü yapılmaz."""
+    calls = {"n": 0}
+
+    def fake_run(*args, **kwargs):
+        calls["n"] += 1
+        raise subprocess.TimeoutExpired(cmd="docker", timeout=10.0)
+
+    _patch_docker_cli(monkeypatch, fake_run)
+    engine = get_execution_engine("docker")
+
+    assert calls["n"] == 1
+    assert isinstance(engine, UnavailableExecutionEngine)
+    assert "10.0s zaman aşımı" in engine.reason
+    assert "exception=TimeoutExpired" in engine.reason
+    assert engine.get_isolation_type() == "none"
+
+
+def test_availability_failure_redacts_secrets(monkeypatch, caplog):
+    """Teşhis ve log, stderr içindeki token benzeri değerleri taşımaz."""
+    def fake_run(*args, **kwargs):
+        class Proc:
+            returncode = 1
+            stdout = ""
+            stderr = "error during connect token=ghp_thisisnotarealtoken"
+
+        return Proc()
+
+    _patch_docker_cli(monkeypatch, fake_run)
+    with caplog.at_level("WARNING"):
+        engine = get_execution_engine("docker")
+
+    assert isinstance(engine, UnavailableExecutionEngine)
+    assert "ghp_" not in engine.reason
+    assert "[redacted]" in engine.reason
+    assert "exit=1" in engine.reason
+    assert "ghp_" not in caplog.text
 
 
 # =====================================================================
@@ -423,8 +533,12 @@ def test_workflow_regression_docker_unavailable_blocks_workflow(monkeypatch):
     monkeypatch.setenv("AI_DEV_TEAM_DB_PATH", db_path)
     monkeypatch.setenv("EXECUTION_ENGINE", "docker")
     monkeypatch.delenv("ALLOW_UNSAFE_HOST_EXECUTION", raising=False)
-    # Docker unavailable simülasyonu
-    monkeypatch.setattr(DockerExecutionEngine, "is_available", lambda self: False)
+    # Docker unavailable simülasyonu. Karar sağlık kontrolünün kendisinden gelir.
+    monkeypatch.setattr(
+        DockerExecutionEngine,
+        "check_availability",
+        lambda self: (False, "Docker daemon çalışmıyor"),
+    )
     init_db(db_path)
 
     try:

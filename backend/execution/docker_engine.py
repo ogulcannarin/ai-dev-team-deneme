@@ -12,14 +12,29 @@ Güvenlik Politikası:
 """
 
 import os
+import re
 import shutil
 import stat
 import subprocess
 import time
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .base import BaseExecutionEngine, ExecutionConfig, ExecutionResult
+
+_SECRET_TEXT = re.compile(
+    r"(?i)(bearer\s+\S+|ghp_[A-Za-z0-9]+|github_pat_\S+|sk-[A-Za-z0-9_\-]+|"
+    r"(?:token|api[_-]?key|password|secret|authorization)\s*[=:]\s*\S+)"
+)
+
+
+def _public_diagnostic(text: str, limit: int = 240) -> str:
+    """Tek satırlık teşhis. Anahtar, token ve benzeri gizli değerleri yazmaz."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    line = _SECRET_TEXT.sub("[redacted]", raw.splitlines()[0])
+    return line[:limit]
 
 
 class DockerExecutionEngine(BaseExecutionEngine):
@@ -29,6 +44,7 @@ class DockerExecutionEngine(BaseExecutionEngine):
 
     def __init__(self, default_config: Optional[ExecutionConfig] = None):
         self.default_config = default_config or ExecutionConfig()
+        self.last_availability: Optional[Tuple[bool, str]] = None
 
     def get_isolation_type(self) -> str:
         return "docker"
@@ -55,7 +71,13 @@ class DockerExecutionEngine(BaseExecutionEngine):
         """
         docker_cmd = self._get_docker_cmd()
         if not shutil.which(docker_cmd) and not os.path.isfile(docker_cmd):
-            return False, f"Docker CLI yürütülebilir dosyası sistem PATH üzerinde bulunamadı (aranan: {docker_cmd})."
+            result = (
+                False,
+                "Docker CLI yürütülebilir dosyası sistem PATH üzerinde bulunamadı "
+                f"(aranan: {docker_cmd})."
+            )
+            self.last_availability = result
+            return result
 
         try:
             res = subprocess.run(
@@ -66,15 +88,31 @@ class DockerExecutionEngine(BaseExecutionEngine):
                 stdin=subprocess.DEVNULL
             )
             if res.returncode == 0 and len(res.stdout.strip()) > 0:
-                return True, f"Docker daemon aktif (Versiyon: {res.stdout.strip()})"
-            err_msg = (res.stderr or "").strip() or f"Dönüş kodu: {res.returncode}"
-            # Hassas bilgi sızıntısını önlemek için çıktıyı temizle
-            err_msg = err_msg.splitlines()[0] if err_msg else f"Dönüş kodu: {res.returncode}"
-            return False, f"Docker daemon yanıt vermiyor ({err_msg}). Docker Desktop'ın çalıştığından emin olun."
+                version = _public_diagnostic(res.stdout.strip(), limit=80)
+                result = (True, f"Docker daemon aktif (Versiyon: {version})")
+            else:
+                err_msg = _public_diagnostic(res.stderr) or f"Dönüş kodu: {res.returncode}"
+                result = (
+                    False,
+                    "Docker daemon yanıt vermiyor "
+                    f"(exit={res.returncode}; {err_msg}). "
+                    "Docker Desktop'ın çalıştığından emin olun."
+                )
         except subprocess.TimeoutExpired:
-            return False, "Docker daemon yanıt vermedi (10.0s zaman aşımı)."
+            result = (
+                False,
+                "Docker daemon yanıt vermedi (10.0s zaman aşımı; exception=TimeoutExpired)."
+            )
         except Exception as exc:
-            return False, f"Docker bağlantı kontrolü sırasında hata: {str(exc)}"
+            detail = _public_diagnostic(str(exc))
+            suffix = f": {detail}" if detail else ""
+            result = (
+                False,
+                "Docker bağlantı kontrolü sırasında hata: "
+                f"exception={type(exc).__name__}{suffix}"
+            )
+        self.last_availability = result
+        return result
 
     def is_available(self) -> bool:
         """Docker CLI ve Docker daemon'ın erişilebilir olup olmadığını doğrular."""
@@ -111,12 +149,11 @@ class DockerExecutionEngine(BaseExecutionEngine):
                 error=f"Çalışma alanı dizini mevcut değil: {workspace_path}"
             )
 
-        if not self.is_available():
-            _, diag_msg = (
-                self.check_availability()
-                if hasattr(self, "check_availability")
-                else (False, "Docker daemon erişilemez.")
-            )
+        if self.last_availability is not None:
+            available, diag_msg = self.last_availability
+        else:
+            available, diag_msg = self.check_availability()
+        if not available:
             return ExecutionResult(
                 status="blocked",
                 exit_code=-1,

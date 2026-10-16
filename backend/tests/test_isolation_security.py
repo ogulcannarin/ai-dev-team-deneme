@@ -135,8 +135,12 @@ def test_engine_factory_defaults_to_docker_or_unavailable(monkeypatch):
     monkeypatch.setenv("EXECUTION_ENGINE", "docker")
     monkeypatch.delenv("ALLOW_UNSAFE_HOST_EXECUTION", raising=False)
 
-    # Docker unavailable simülasyonu
-    monkeypatch.setattr(DockerExecutionEngine, "is_available", lambda self: False)
+    # Docker unavailable simülasyonu. Karar sağlık kontrolünün kendisinden gelir.
+    monkeypatch.setattr(
+        DockerExecutionEngine,
+        "check_availability",
+        lambda self: (False, "Docker daemon çalışmıyor"),
+    )
 
     engine = get_execution_engine("docker")
     assert not engine.is_available()
