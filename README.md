@@ -1,4 +1,4 @@
-# Hesaplama Modulu (task_aea116339a)
+# Hesaplama Modulu (task_7a2f1166fb)
 Bu izole calisma alani Coder Agent tarafindan olusturulmustur.
 - **Modul**: `calculator.py`
 - **Tanim**: Tip guvenli temel aritmetik islemler (toplama, cikarma, carpma, bolme) ve test destegi.
@@ -12,9 +12,8 @@ result = add(2, 3)
 print(result)
 ```
 
-Beklenen cikti:
+Beklenen çıktı:
 
 ```text
 5
 ```
-
