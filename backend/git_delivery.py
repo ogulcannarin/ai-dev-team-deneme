@@ -190,9 +190,13 @@ def _remove_worktree_gitlink(workspace: str) -> None:
         os.remove(link)
 
 
-def _run_git(args: List[str], workspace: str, env: Dict[str, str]) -> subprocess.CompletedProcess:
+def _reject_unsafe_git_args(args: List[str]) -> None:
     if any(not isinstance(arg, str) or arg.startswith("-C") for arg in args):
         raise ValueError("Güvensiz Git argümanı reddedildi.")
+
+
+def _run_git(args: List[str], workspace: str, env: Dict[str, str]) -> subprocess.CompletedProcess:
+    _reject_unsafe_git_args(args)
     return subprocess.run(
         ["git", *args],
         cwd=workspace,
@@ -200,6 +204,26 @@ def _run_git(args: List[str], workspace: str, env: Dict[str, str]) -> subprocess
         capture_output=True,
         text=True,
         timeout=30,
+        shell=False,
+        check=False,
+    )
+
+
+def _run_git_bytes(
+    args: List[str],
+    cwd: str,
+    env: Dict[str, str],
+    data: Optional[bytes] = None,
+    timeout: int = 60,
+) -> subprocess.CompletedProcess:
+    _reject_unsafe_git_args(args)
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=env,
+        input=data,
+        capture_output=True,
+        timeout=timeout,
         shell=False,
         check=False,
     )
@@ -266,6 +290,113 @@ def _base_ref(branch: str) -> str:
     return f"refs/delivery-base/{branch}"
 
 
+def _source_env(source_git: str) -> Dict[str, str]:
+    """Kaynak depoyu salt okur. Teslimat deposunun GIT_DIR değerini taşımaz."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_DIR"] = source_git
+    return env
+
+
+def _verified_commit(workspace: str, env: Dict[str, str], ref: str) -> Optional[str]:
+    """Ref varsa ve bir commit nesnesine işaret ediyorsa tam SHA döner."""
+    probe = _run_git(["rev-parse", "--verify", "--end-of-options", ref], workspace, env)
+    sha = probe.stdout.strip()
+    if probe.returncode != 0 or len(sha) != 40 or not _sha_ok(sha):
+        return None
+    kind = _run_git(["cat-file", "-t", sha], workspace, env)
+    if kind.returncode != 0 or kind.stdout.strip() != "commit":
+        return None
+    return sha
+
+
+def _source_commit(source_git: str, branch: str) -> Optional[str]:
+    env = _source_env(source_git)
+    probe = _run_git(
+        ["rev-parse", "--verify", "--end-of-options", f"refs/heads/{branch}"],
+        source_git,
+        env,
+    )
+    sha = probe.stdout.strip()
+    if probe.returncode != 0 or len(sha) != 40 or not _sha_ok(sha):
+        return None
+    return sha
+
+
+def _source_is_shallow(source_git: str) -> bool:
+    env = _source_env(source_git)
+    probe = _run_git(["rev-parse", "--is-shallow-repository"], source_git, env)
+    return probe.returncode == 0 and probe.stdout.strip() == "true"
+
+
+def _reachable_object_ids(source_git: str, sha: str) -> Optional[bytes]:
+    """Sığ sınırda duran geçmişin commit, ağaç ve blob kimliklerini döner."""
+    listed = _run_git_bytes(["rev-list", "--objects", sha], source_git, _source_env(source_git))
+    if listed.returncode != 0:
+        return None
+    identifiers = []
+    for raw in listed.stdout.splitlines():
+        token = raw.split(b" ", 1)[0].strip()
+        if len(token) != 40:
+            return None
+        try:
+            text = token.decode("ascii")
+        except UnicodeError:
+            return None
+        if not _sha_ok(text):
+            return None
+        identifiers.append(token)
+    if sha.encode("ascii") not in identifiers:
+        return None
+    return b"\n".join(identifiers) + b"\n"
+
+
+def _copy_shallow_objects(source_git: str, workspace: str, env: Dict[str, str], sha: str) -> bool:
+    """Sığ kaynaktaki erişilebilir nesneleri teslimat deposuna kopyalar. Kaynak ref'leri değiştirmez."""
+    identifiers = _reachable_object_ids(source_git, sha)
+    if not identifiers:
+        return False
+    packed = _run_git_bytes(
+        ["pack-objects", "--stdout", "--no-reuse-delta"],
+        source_git,
+        _source_env(source_git),
+        data=identifiers,
+    )
+    if packed.returncode != 0 or not packed.stdout:
+        return False
+    unpacked = _run_git_bytes(["unpack-objects"], workspace, env, data=packed.stdout)
+    return unpacked.returncode == 0
+
+
+def _record_shallow_boundaries(source_git: str, git_dir: str, workspace: str, env: Dict[str, str]) -> None:
+    """Kaynakta sığ sınır olan ve teslimat deposunda bulunan commit'leri sığ kök olarak işaretler."""
+    source_shallow = os.path.join(source_git, "shallow")
+    if not os.path.isfile(source_shallow):
+        return
+    with open(source_shallow, "r", encoding="ascii") as handle:
+        recorded = [line.strip() for line in handle if line.strip()]
+    additions = []
+    for sha in recorded:
+        if len(sha) != 40 or not _sha_ok(sha):
+            continue
+        kind = _run_git(["cat-file", "-t", sha], workspace, env)
+        if kind.returncode == 0 and kind.stdout.strip() == "commit":
+            additions.append(sha)
+    if not additions:
+        return
+    destination = os.path.join(git_dir, "shallow")
+    lines = []
+    if os.path.isfile(destination):
+        with open(destination, "r", encoding="ascii") as handle:
+            lines = [line.strip() for line in handle if line.strip()]
+    for sha in additions:
+        if sha not in lines:
+            lines.append(sha)
+    with open(destination, "w", encoding="ascii", newline="\n") as handle:
+        for sha in lines:
+            handle.write(sha + "\n")
+
+
 def _import_base_commit(workspace: str, env: Dict[str, str], source_git: str, git_dir: str) -> Optional[str]:
     """Ana dal nesnelerini teslimat deposuna kopyalar. Kaynak depoyu ve ana dalı değiştirmez."""
     source = os.path.abspath(source_git)
@@ -278,18 +409,31 @@ def _import_base_commit(workspace: str, env: Dict[str, str], source_git: str, gi
         return None
     branch = _base_branch_name()
     destination = _base_ref(branch)
-    fetched = _run_git(
+    expected = _source_commit(source, branch)
+    if expected is None:
+        return None
+    _run_git(
         ["fetch", "--no-tags", "--", source, f"refs/heads/{branch}:{destination}"],
         workspace,
         env,
     )
-    if fetched.returncode != 0:
+    # Çıkış kodu 0 olsa bile ref beklenen commit'e işaret etmiyorsa fetch başarılı sayılmaz.
+    imported = _verified_commit(workspace, env, destination)
+    if imported == expected:
+        return expected
+    if not _source_is_shallow(source):
         return None
-    probe = _run_git(["rev-parse", "--verify", "--end-of-options", destination], workspace, env)
-    sha = probe.stdout.strip()
-    if probe.returncode != 0 or not _sha_ok(sha) or len(sha) != 40:
+    if not _copy_shallow_objects(source, workspace, env, expected):
         return None
-    return sha
+    _record_shallow_boundaries(source, git_dir, workspace, env)
+    if imported is not None and not _is_ancestor(workspace, env, imported, expected):
+        return None
+    previous = imported if imported is not None else "0" * 40
+    _run_git(["update-ref", destination, expected, previous], workspace, env)
+    verified = _verified_commit(workspace, env, destination)
+    if verified != expected:
+        return None
+    return expected
 
 
 def _is_ancestor(workspace: str, env: Dict[str, str], base_sha: str, commit_sha: str) -> bool:

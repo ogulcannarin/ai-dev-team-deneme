@@ -5,6 +5,7 @@ Git varsa temp depoda gerçek commit davranışını da doğrular.
 
 import asyncio
 import os
+import pathlib
 import shutil
 import stat
 import sys
@@ -133,6 +134,13 @@ def test_isolated_branch_commit_is_idempotent_and_leaves_parent_untouched(tmp_pa
     branch = _git(workspace_path, "rev-parse", "--abbrev-ref", "HEAD", git_dir=git_dir, work_tree=workspace_path)
     assert branch == "task/task_delivery"
     assert _git(workspace_path, "rev-parse", "HEAD^", git_dir=git_dir, work_tree=workspace_path) == parent_head
+    assert _git(
+        workspace_path,
+        "rev-parse",
+        "refs/delivery-base/main",
+        git_dir=git_dir,
+        work_tree=workspace_path,
+    ) == parent_head
     tree = _git(workspace_path, "ls-tree", "-r", "--name-only", "HEAD", git_dir=git_dir, work_tree=workspace_path)
     assert "user.txt" in tree
     assert "README.md" in tree
@@ -539,3 +547,209 @@ def test_restart_reads_failed_delivery_then_successful_retry(workflow_env, git_a
         assert reread.events[-1].details["commit"] == head
     finally:
         _remove_task_delivery(task_id)
+
+
+def _commit_file(repo: str, name: str, content: str, message: str) -> str:
+    with open(os.path.join(repo, name), "w", encoding="utf-8") as handle:
+        handle.write(content)
+    _git(repo, "-c", "user.name=User", "-c", "user.email=user@example.com", "add", "--", name)
+    _git(repo, "-c", "user.name=User", "-c", "user.email=user@example.com", "commit", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _shallow_clone(source: str, destination: str) -> None:
+    _git(source, "clone", "--depth", "1", "--branch", "main", pathlib.Path(source).resolve().as_uri(), destination)
+
+
+def _noop_fetch(real_run):
+    def _run(args, **kwargs):
+        command = args[0] if isinstance(args, tuple) else args
+        if isinstance(command, list) and "fetch" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return real_run(args, **kwargs)
+
+    return _run
+
+
+def test_shallow_source_imports_exact_base_without_rewriting_source(tmp_path, git_available):
+    source = tmp_path / "full-source"
+    source.mkdir()
+    _git(str(source), "init", "-b", "main")
+    _commit_file(str(source), "user.txt", "bir\n", "ilk")
+    tip = _commit_file(str(source), "user.txt", "iki\n", "ikinci")
+    shallow_file = source / ".git" / "shallow"
+    checkout = tmp_path / "shallow-checkout"
+    _shallow_clone(str(source), str(checkout))
+    shallow_head = _git(str(checkout), "rev-parse", "HEAD")
+    shallow_marker = (checkout / ".git" / "shallow").read_text(encoding="ascii")
+    assert _git(str(checkout), "rev-parse", "--is-shallow-repository") == "true"
+    assert shallow_head == tip
+    assert not shallow_file.exists()
+
+    root = checkout / "workspaces"
+    task_id = "task_shallow"
+    workspace = root / task_id
+    workspace.mkdir(parents=True)
+    (workspace / "README.md").write_text("sig teslim\n", encoding="utf-8")
+    first = deliver_task_workspace(task_id, str(root), ["README.md"])
+    assert first["status"] == "committed"
+    assert first["commit"]
+    workspace_path, git_dir = _delivery_paths(str(root), task_id)
+    base = _git(workspace_path, "rev-parse", "refs/delivery-base/main", git_dir=git_dir, work_tree=workspace_path)
+    assert base == shallow_head
+    assert _git(workspace_path, "rev-parse", "HEAD^", git_dir=git_dir, work_tree=workspace_path) == shallow_head
+    assert _git(
+        workspace_path,
+        "merge-base",
+        "--is-ancestor",
+        base,
+        "HEAD",
+        git_dir=git_dir,
+        work_tree=workspace_path,
+    ) == ""
+    assert _git(
+        workspace_path,
+        "rev-list",
+        "--count",
+        "refs/delivery-base/main..HEAD",
+        git_dir=git_dir,
+        work_tree=workspace_path,
+    ) == "1"
+    tree = _git(workspace_path, "ls-tree", "-r", "--name-only", "HEAD", git_dir=git_dir, work_tree=workspace_path)
+    assert "user.txt" in tree
+    assert "README.md" in tree
+    assert _git(str(checkout), "rev-parse", "HEAD") == shallow_head
+    assert (checkout / ".git" / "shallow").read_text(encoding="ascii") == shallow_marker
+    assert _git(str(source), "rev-parse", "HEAD") == tip
+    assert "task/task_shallow" not in _git(str(source), "branch", "--list")
+
+    second = deliver_task_workspace(task_id, str(root), ["README.md"])
+    assert second["status"] == "reused"
+    assert second["commit"] == first["commit"]
+    assert _git(workspace_path, "rev-parse", "refs/delivery-base/main", git_dir=git_dir, work_tree=workspace_path) == base
+
+
+def test_shallow_fetch_without_ref_still_imports_expected_commit(tmp_path, monkeypatch, git_available):
+    source = tmp_path / "full-source"
+    source.mkdir()
+    _git(str(source), "init", "-b", "main")
+    tip = _commit_file(str(source), "user.txt", "sig\n", "tek")
+    checkout = tmp_path / "shallow-checkout"
+    _shallow_clone(str(source), str(checkout))
+    root = checkout / "workspaces"
+    task_id = "task_shallow_fetch"
+    workspace = root / task_id
+    workspace.mkdir(parents=True)
+    (workspace / "README.md").write_text("kopya\n", encoding="utf-8")
+    monkeypatch.setattr("git_delivery.subprocess.run", _noop_fetch(subprocess.run))
+    result = deliver_task_workspace(task_id, str(root), ["README.md"])
+    assert result["status"] == "committed"
+    workspace_path, git_dir = _delivery_paths(str(root), task_id)
+    assert _git(workspace_path, "rev-parse", "refs/delivery-base/main", git_dir=git_dir, work_tree=workspace_path) == tip
+    assert _git(workspace_path, "rev-parse", "HEAD^", git_dir=git_dir, work_tree=workspace_path) == tip
+    assert _git(str(checkout), "rev-parse", "HEAD") == tip
+
+
+def test_fetch_exit_zero_without_ref_fails_for_full_repository(tmp_path, monkeypatch, git_available):
+    parent = tmp_path / "parent-repo"
+    parent.mkdir()
+    _git(str(parent), "init", "-b", "main")
+    _commit_file(str(parent), "user.txt", "tam\n", "tam depo")
+    root = parent / "workspaces"
+    task_id = "task_fetch_ignored"
+    workspace = root / task_id
+    workspace.mkdir(parents=True)
+    (workspace / "README.md").write_text("yok\n", encoding="utf-8")
+    monkeypatch.setattr("git_delivery.subprocess.run", _noop_fetch(subprocess.run))
+    result = deliver_task_workspace(task_id, str(root), ["README.md"])
+    assert result["status"] == "failed"
+    assert result["commit"] is None
+    assert "Ana dal geçmişi teslimat deposuna alınamadı" in str(result["reason"])
+    git_dir = root / ".delivery" / f"{task_id}.git"
+    probe = subprocess.run(
+        ["git", "rev-parse", "--verify", "refs/delivery-base/main"],
+        cwd=str(workspace),
+        env={
+            **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+            "GIT_DIR": str(git_dir),
+            "GIT_WORK_TREE": str(workspace),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode != 0
+
+
+def test_unrelated_base_ref_is_not_rewritten(tmp_path, git_available):
+    parent = tmp_path / "parent-repo"
+    parent.mkdir()
+    _git(str(parent), "init", "-b", "main")
+    source_head = _commit_file(str(parent), "user.txt", "kaynak\n", "kaynak")
+    root = parent / "workspaces"
+    task_id = "task_unrelated"
+    workspace = root / task_id
+    workspace.mkdir(parents=True)
+    (workspace / "README.md").write_text("gorev\n", encoding="utf-8")
+    git_dir = root / ".delivery" / f"{task_id}.git"
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    _git(str(unrelated), "init", "-b", "main")
+    unrelated_head = _commit_file(str(unrelated), "other.txt", "baska\n", "baska")
+    os.makedirs(git_dir, exist_ok=True)
+    _git(str(workspace), "init", "--separate-git-dir", str(git_dir), "-b", "task/task_unrelated")
+    _git(str(workspace), "fetch", "--no-tags", "--", str(unrelated / ".git"), f"{unrelated_head}:refs/delivery-base/main")
+    assert _git(str(workspace), "rev-parse", "refs/delivery-base/main") == unrelated_head
+
+    result = deliver_task_workspace(task_id, str(root), ["README.md"])
+    assert result["status"] == "failed"
+    assert result["commit"] is None
+    assert _git(
+        str(workspace),
+        "rev-parse",
+        "refs/delivery-base/main",
+        git_dir=str(git_dir),
+        work_tree=str(workspace),
+    ) == unrelated_head
+    assert _git(str(parent), "rev-parse", "HEAD") == source_head
+
+
+def test_shallow_repeated_and_concurrent_delivery_keep_one_history(tmp_path, git_available):
+    source = tmp_path / "full-source"
+    source.mkdir()
+    _git(str(source), "init", "-b", "main")
+    tip = _commit_file(str(source), "user.txt", "ortak\n", "taban")
+    checkout = tmp_path / "shallow-checkout"
+    _shallow_clone(str(source), str(checkout))
+    root = checkout / "workspaces"
+    task_id = "task_shallow_parallel"
+    workspace = root / task_id
+    workspace.mkdir(parents=True)
+    (workspace / "README.md").write_text("paralel\n", encoding="utf-8")
+    barrier = threading.Barrier(2)
+    results = []
+
+    def _worker():
+        barrier.wait(timeout=10)
+        results.append(deliver_task_workspace(task_id, str(root), ["README.md"]))
+
+    threads = [threading.Thread(target=_worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert len(results) == 2
+    assert all(item["status"] in {"committed", "reused"} for item in results)
+    assert len({item["commit"] for item in results}) == 1
+    workspace_path, git_dir = _delivery_paths(str(root), task_id)
+    assert _git(workspace_path, "rev-parse", "refs/delivery-base/main", git_dir=git_dir, work_tree=workspace_path) == tip
+    assert _git(
+        workspace_path,
+        "rev-list",
+        "--count",
+        "refs/delivery-base/main..HEAD",
+        git_dir=git_dir,
+        work_tree=workspace_path,
+    ) == "1"
+    repeated = deliver_task_workspace(task_id, str(root), ["README.md"])
+    assert repeated["status"] == "reused"
+    assert repeated["commit"] == results[0]["commit"]
