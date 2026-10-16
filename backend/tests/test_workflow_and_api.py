@@ -514,7 +514,12 @@ def test_run_agent_workflow_success_with_planner_scope_coder_and_tester():
     task_id = "task_full_flow_test"
     desc = "Build FastAPI REST API endpoints with auth middleware and rate limiting"
 
-    result = asyncio.run(run_agent_workflow(task_id, desc))
+    result = asyncio.run(run_agent_workflow(
+        task_id,
+        desc,
+        planner_mode="deterministic",
+        coder_mode="deterministic",
+    ))
 
     assert result["task_id"] == task_id
     assert result["status"] == TaskStatus.REVIEWED.value
@@ -629,7 +634,11 @@ def test_create_task_empty_description_validation(client):
 def test_run_task_workflow_success(client):
     """POST /tasks/{task_id}/run endpoint'inin LangGraph akışını (Planner + Scope + Coder + Tester + Reviewer) tetikleyip 'reviewed' döndürdüğünü test eder."""
     # 1. Görevi oluştur
-    create_res = client.post("/tasks", json={"description": "FastAPI REST API endpoints for user authentication and rate limiting"})
+    create_res = client.post("/tasks", json={
+        "description": "FastAPI REST API endpoints for user authentication and rate limiting",
+        "planner_mode": "deterministic",
+        "coder_mode": "deterministic",
+    })
     assert create_res.status_code == 201
     task_id = create_res.json()["id"]
 

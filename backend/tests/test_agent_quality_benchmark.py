@@ -95,6 +95,8 @@ def test_benchmark_01_successful_rest_api_generation(monkeypatch):
     result = asyncio.run(run_agent_workflow(
         task_id=task_id,
         description=desc,
+        planner_mode="deterministic",
+        coder_mode="deterministic",
         max_retries=2
     ))
     duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
@@ -138,7 +140,9 @@ def test_benchmark_02_data_model_and_validation(monkeypatch):
     start_time = time.perf_counter()
     result = asyncio.run(run_agent_workflow(
         task_id=task_id,
-        description=desc
+        description=desc,
+        planner_mode="deterministic",
+        coder_mode="deterministic",
     ))
     duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
@@ -346,6 +350,8 @@ def test_benchmark_06_true_retry_recovery(monkeypatch):
     result = asyncio.run(run_agent_workflow(
         task_id=task_id,
         description="FastAPI Items CRUD REST API",
+        planner_mode="deterministic",
+        coder_mode="deterministic",
         max_retries=2
     ))
     duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
