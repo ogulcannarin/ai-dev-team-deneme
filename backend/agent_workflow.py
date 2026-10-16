@@ -2219,11 +2219,15 @@ def _execute_tester_in_workspace(
 
     # Execution Engine seçimi ve yürütme
     exec_engine = engine or get_execution_engine()
-    is_engine_available = exec_engine.is_available()
-    engine_diag = getattr(exec_engine, "reason", None)
-    if hasattr(exec_engine, "check_availability"):
-        _, diag = exec_engine.check_availability()
-        engine_diag = diag
+    cached_availability = getattr(exec_engine, "last_availability", None)
+    if isinstance(cached_availability, tuple) and len(cached_availability) == 2:
+        is_engine_available = bool(cached_availability[0])
+        engine_diag = cached_availability[1]
+    elif hasattr(exec_engine, "check_availability"):
+        is_engine_available, engine_diag = exec_engine.check_availability()
+    else:
+        is_engine_available = exec_engine.is_available()
+        engine_diag = getattr(exec_engine, "reason", None)
 
     logger.info(
         f"[TESTER_ENGINE] Engine: {type(exec_engine).__name__} | "

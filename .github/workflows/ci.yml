@@ -30,6 +30,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Fetch verified base ref
+        working-directory: ${{ github.workspace }}
+        run: git fetch --no-tags --depth=1 origin "refs/heads/main:refs/remotes/origin/main"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

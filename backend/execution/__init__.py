@@ -93,22 +93,17 @@ def get_execution_engine(preferred: Optional[str] = None) -> BaseExecutionEngine
             reason="Host üzerinde güvensiz kod çalıştırma izni verilmedi (ALLOW_UNSAFE_HOST_EXECUTION kapalı)."
         )
 
-    # Varsayılan: Docker motoru
+    # Varsayılan: Docker motoru. Karar ve teşhis aynı sağlık kontrolünden gelir.
     docker_engine = DockerExecutionEngine()
-    if docker_engine.is_available():
-        _, docker_diag = (
-            docker_engine.check_availability()
-            if hasattr(docker_engine, "check_availability")
-            else (True, "Docker daemon aktif")
-        )
+    if hasattr(docker_engine, "check_availability"):
+        docker_ok, docker_diag = docker_engine.check_availability()
+    else:
+        docker_ok = docker_engine.is_available()
+        docker_diag = "Docker daemon aktif" if docker_ok else "Docker daemon kontrol edilemedi."
+    if docker_ok:
         logger.info(f"[ENGINE_FACTORY] Selected DockerExecutionEngine: {docker_diag}")
         return docker_engine
 
-    _, docker_diag = (
-        docker_engine.check_availability()
-        if hasattr(docker_engine, "check_availability")
-        else (False, "Docker daemon kontrol edilemedi.")
-    )
     logger.warning(f"[ENGINE_FACTORY] Docker unavailable: {docker_diag}")
 
     # Docker yoksa ve güvensiz çalıştırma izni yoksa: BLOCKED
