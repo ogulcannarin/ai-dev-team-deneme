@@ -1,19 +1,4 @@
-# Hesaplama Modulu (task_7a2f1166fb)
+# REST API Feature (task_86b5d24ab5)
 Bu izole calisma alani Coder Agent tarafindan olusturulmustur.
-- **Modul**: `calculator.py`
-- **Tanim**: Tip guvenli temel aritmetik islemler (toplama, cikarma, carpma, bolme) ve test destegi.
-
-## Kullanim
-
-```python
-from calculator import add
-
-result = add(2, 3)
-print(result)
-```
-
-Beklenen çıktı:
-
-```text
-5
-```
+- **Moduller**: `models.py`, `api_feature.py`
+- **Tanim**: Pydantic tip dogrulamasi ve FastAPI APIRouter CRUD endpointleri.
