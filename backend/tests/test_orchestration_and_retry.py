@@ -6,22 +6,28 @@ AI Dev Team - Agent Orchestration, Kontrollü Retry ve İnsan Onayı Test Paketi
 import asyncio
 import os
 import tempfile
+from datetime import datetime, timezone
+
 import pytest
 from fastapi.testclient import TestClient
 
 from database import init_db
 from execution.mock_engine import MockExecutionEngine
-from main import app, get_task_repository, get_workflow_run_repository
+from main import app, _persist_workflow_state, get_task_repository, get_workflow_run_repository
 from repository import TaskRepository, WorkflowRunRepository
 from schemas import (
     ReviewerVerdict,
     TaskApprovalRequest,
     TaskRejectRequest,
+    TaskScope,
     TaskStatus,
 )
 from agent_workflow import (
+    _execute_coder_in_workspace,
     _execute_reviewer_in_workspace,
     _execute_tester_in_workspace,
+    _route_after_tester,
+    fix_exhausted_node,
     run_agent_workflow,
 )
 
@@ -203,6 +209,220 @@ def test_task_cancellation_flow(client):
 # =====================================================================
 # 3. BÖLÜM: Eşzamanlılık ve Çakışma Koruması Testleri
 # =====================================================================
+
+def test_tester_routes_keep_retry_count_and_split_block_reasons():
+    """İlk başarı sayacı artırmaz. İzolasyon engeli retry başlatmaz. Tükenme ayrı gerekçe yazar."""
+    success = {
+        "tester": {"status": "tested", "passed": 4, "failed": 0},
+        "retry_count": 0,
+        "max_retries": 2,
+        "retry_history": [],
+    }
+    assert _route_after_tester(success) == "reviewer"
+    assert success["retry_count"] == 0
+    assert success["retry_history"] == []
+
+    blocked = {"tester": {"status": "blocked", "error": "Docker daemon unavailable"}, "retry_count": 0, "max_retries": 2}
+    assert _route_after_tester(blocked) == "reviewer"
+    assert blocked["retry_count"] == 0
+
+    first_failure = {"tester": {"status": "failed", "passed": 1, "failed": 1}, "retry_count": 0, "max_retries": 2}
+    assert _route_after_tester(first_failure) == "retry"
+    assert first_failure["retry_count"] == 0
+
+    exhausted_route = {"tester": {"status": "failed", "passed": 0, "failed": 1}, "retry_count": 2, "max_retries": 2, "events": []}
+    assert _route_after_tester(exhausted_route) == "fix_exhausted"
+    result = fix_exhausted_node(exhausted_route)
+    assert result["status"] == TaskStatus.BLOCKED.value
+    assert result["retry_count"] == 2
+    assert "test_retries_exhausted" in result["error"]
+    assert result["events"][-1]["details"]["reason"] == "test_retries_exhausted"
+    assert "reviewer_completed" not in [event["type"] for event in result["events"]]
+
+
+def test_scope_allowlist_rejects_overwrite_outside_scope(tmp_path):
+    """allow_overwrite=True Scope dışındaki dosyayı yazamaz."""
+    scope = TaskScope(
+        summary="hesap",
+        existing_files=[],
+        proposed_new_files=["backend/calculator.py"],
+        out_of_scope=[".env"],
+        risks=[],
+    )
+    rejected = _execute_coder_in_workspace(
+        task_id="task_scope_guard",
+        description="Create calculator.py",
+        scope=scope,
+        workspaces_root=str(tmp_path),
+        allow_overwrite=True,
+        code_files={"middleware.py": "print('no')\n"},
+    )
+    assert rejected.status == "failed"
+    assert "Scope dışı dosya" in (rejected.error or "")
+    assert not (tmp_path / "task_scope_guard" / "middleware.py").exists()
+
+    workspace = tmp_path / "task_same_content"
+    workspace.mkdir()
+    (workspace / "calculator.py").write_text("same\n", encoding="utf-8")
+    unchanged = _execute_coder_in_workspace(
+        task_id="task_same_content",
+        description="Create calculator.py",
+        scope=scope,
+        workspaces_root=str(tmp_path),
+        allow_overwrite=True,
+        code_files={"calculator.py": "same\n"},
+        tester_feedback={
+            "status": "failed",
+            "error": "AssertionError: expected 5",
+            "test_results": [{"name": "test_01_addition_operations", "status": "failed", "error": "expected 5"}],
+        },
+        prior_created_files=["workspaces/task_same_content/calculator.py"],
+    )
+    assert unchanged.status == "coded"
+    assert any("içerik değişmedi" in item for item in unchanged.limitations)
+    assert (workspace / "calculator.py").read_text(encoding="utf-8") == "same\n"
+
+
+def test_empty_scope_proposal_rejects_unapproved_file(tmp_path):
+    """Scope önerisi boşken beyaz listedeki bir dosya da yazılamaz."""
+    scope = TaskScope(
+        summary="bos",
+        existing_files=[],
+        proposed_new_files=[],
+        out_of_scope=[".env"],
+        risks=[],
+    )
+    rejected = _execute_coder_in_workspace(
+        task_id="task_empty_scope",
+        description="FastAPI Items CRUD REST API",
+        scope=scope,
+        workspaces_root=str(tmp_path),
+        allow_overwrite=True,
+        code_files={"models.py": "class Item: pass\n"},
+    )
+    assert rejected.status == "failed"
+    assert "Scope dışı dosya" in (rejected.error or "")
+    assert not (tmp_path / "task_empty_scope" / "models.py").exists()
+
+
+def test_reviewer_change_request_does_not_pretend_template_changed(tmp_path):
+    """Aynı şablon Reviewer talebiyle başarılı düzeltme sayılmaz. Farklı içerik yazılabilir."""
+    scope = TaskScope(
+        summary="hesap",
+        existing_files=[],
+        proposed_new_files=["calculator.py"],
+        out_of_scope=[],
+        risks=[],
+    )
+    workspace = tmp_path / "task_reviewer_same"
+    workspace.mkdir()
+    (workspace / "calculator.py").write_text("same\n", encoding="utf-8")
+    stuck = _execute_coder_in_workspace(
+        task_id="task_reviewer_same",
+        description="Create calculator.py",
+        scope=scope,
+        workspaces_root=str(tmp_path),
+        allow_overwrite=True,
+        coder_mode="deterministic",
+        code_files={"calculator.py": "same\n"},
+        reviewer_feedback={
+            "verdict": "changes_requested",
+            "summary": "Eksik docstring giderilmeli.",
+            "findings": [{"severity": "low", "title": "Docstring", "description": "add fonksiyonu belgelenmeli", "recommendation": "Docstring ekle"}],
+        },
+        tester_feedback={"status": "tested", "passed": 4, "failed": 0, "error": None},
+    )
+    assert stuck.status == "failed"
+    assert "deterministik şablon" in (stuck.error or "")
+    assert stuck.status != "coded"
+    assert (workspace / "calculator.py").read_text(encoding="utf-8") == "same\n"
+
+    changed = _execute_coder_in_workspace(
+        task_id="task_reviewer_same",
+        description="Create calculator.py",
+        scope=scope,
+        workspaces_root=str(tmp_path),
+        allow_overwrite=True,
+        coder_mode="deterministic",
+        code_files={"calculator.py": "def add(a, b):\n    return a + b\n"},
+        reviewer_feedback={"verdict": "changes_requested", "summary": "Docstring", "findings": []},
+        tester_feedback={"status": "tested", "passed": 4, "failed": 0},
+    )
+    assert changed.status == "coded"
+    assert "return a + b" in (workspace / "calculator.py").read_text(encoding="utf-8")
+
+
+def test_resume_persist_keeps_retry_on_task_and_run(tmp_path, monkeypatch):
+    """Onay veya ret sonrası kalıcılık görev ve workflow-run retry kayıtlarını birlikte yazar."""
+    db_path = str(tmp_path / "resume_retry.db")
+    monkeypatch.setenv("AI_DEV_TEAM_DB_PATH", db_path)
+    init_db(db_path)
+    tasks = TaskRepository(db_path)
+    runs = WorkflowRunRepository(db_path)
+    tasks.create_task("task_resume_retry", "Calculator")
+    runs.create_run("task_resume_retry")
+    history = [{"attempt": 1, "tester": {"status": "failed", "error": "AssertionError"}}]
+    updated = _persist_workflow_state(
+        "task_resume_retry",
+        {
+            "status": TaskStatus.CHANGES_REQUESTED.value,
+            "retry_count": 1,
+            "retry_history": history,
+            "events": [],
+            "error": "İnsan incelemesi reddi: ek test gerekli.",
+        },
+        datetime.now(timezone.utc),
+    )
+    assert updated is not None
+    assert updated.retry_count == 1
+    assert updated.retry_history[0]["attempt"] == 1
+    stored_runs = runs.list_runs_for_task("task_resume_retry")
+    assert stored_runs[-1].retry_count == updated.retry_count
+    assert stored_runs[-1].retry_history[0]["tester"]["status"] == "failed"
+    fetched = tasks.get_task("task_resume_retry")
+    assert fetched is not None
+    assert fetched.retry_count == stored_runs[-1].retry_count
+    assert fetched.retry_history == stored_runs[-1].retry_history
+
+
+def test_retry_fields_persist_on_task_and_workflow_run(tmp_path):
+    """retry_count ve retry_history görev ve çalıştırma kayıtlarında kalır."""
+    db_path = str(tmp_path / "retry_persist.db")
+    init_db(db_path)
+    tasks = TaskRepository(db_path)
+    runs = WorkflowRunRepository(db_path)
+    tasks.create_task("task_retry_persist", "Calculator")
+    history = [{"attempt": 1, "tester": {"status": "failed", "error": "AssertionError"}}]
+    updated = tasks.update_task_workflow_result(
+        "task_retry_persist",
+        status=TaskStatus.BLOCKED,
+        error="Test düzeltme denemeleri tükendi (reason=test_retries_exhausted).",
+        retry_count=2,
+        retry_history=history,
+    )
+    assert updated is not None
+    assert updated.retry_count == 2
+    assert updated.retry_history[0]["attempt"] == 1
+    fetched = tasks.get_task("task_retry_persist")
+    assert fetched is not None
+    assert fetched.retry_count == 2
+    assert "test_retries_exhausted" in (fetched.error or "")
+
+    created = runs.create_run("task_retry_persist")
+    completed = runs.complete_run(
+        created.id,
+        status=TaskStatus.BLOCKED,
+        error=fetched.error,
+        retry_count=2,
+        retry_history=history,
+    )
+    assert completed is not None
+    assert completed.retry_count == 2
+    assert completed.retry_history[0]["tester"]["status"] == "failed"
+    stored = runs.get_run(created.id)
+    assert stored is not None
+    assert stored.retry_count == 2
+
 
 def test_duplicate_concurrent_run_conflict(client):
     """Aynı görev için aynı anda iki kez run çağrıldığında kilit mekanizması 409 Conflict veya güvenli sıra sağlamalıdır."""
