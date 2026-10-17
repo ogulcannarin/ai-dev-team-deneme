@@ -11,6 +11,7 @@ Güvenlik Politikası:
 6. 5s katı timeout ve 'docker kill' / 'docker rm -f' ile temizlik garantisi.
 """
 
+import logging
 import os
 import re
 import shutil
@@ -21,6 +22,11 @@ import uuid
 from typing import List, Optional, Tuple
 
 from .base import BaseExecutionEngine, ExecutionConfig, ExecutionResult
+
+logger = logging.getLogger("ai_dev_team.execution")
+
+_DOCKER_INFO_TIMEOUT_SECONDS = 10.0
+_INTERRUPTED_DOCKER_INFO_EXIT = 130
 
 _SECRET_TEXT = re.compile(
     r"(?i)(bearer\s+\S+|ghp_[A-Za-z0-9]+|github_pat_\S+|sk-[A-Za-z0-9_\-]+|"
@@ -35,6 +41,74 @@ def _public_diagnostic(text: str, limit: int = 240) -> str:
         return ""
     line = _SECRET_TEXT.sub("[redacted]", raw.splitlines()[0])
     return line[:limit]
+
+
+def _run_docker_info_probe(docker_cmd: str) -> tuple[bool, str, Optional[int]]:
+    """docker info sağlık kontrolünü bir kez çalıştırır.
+
+    Dönüş: (başarılı mı, teşhis, çıkış kodu). Zaman aşımı ve diğer
+    istisnalarda çıkış kodu None olur; bu çağrılar yeniden denenmez.
+    """
+    try:
+        res = subprocess.run(
+            [docker_cmd, "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True,
+            text=True,
+            timeout=_DOCKER_INFO_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            False,
+            "Docker daemon yanıt vermedi "
+            f"({_DOCKER_INFO_TIMEOUT_SECONDS:.1f}s zaman aşımı; exception=TimeoutExpired).",
+            None,
+        )
+    except Exception as exc:
+        detail = _public_diagnostic(str(exc))
+        suffix = f": {detail}" if detail else ""
+        return (
+            False,
+            "Docker bağlantı kontrolü sırasında hata: "
+            f"exception={type(exc).__name__}{suffix}",
+            None,
+        )
+
+    if res.returncode == 0 and len(res.stdout.strip()) > 0:
+        version = _public_diagnostic(res.stdout.strip(), limit=80)
+        return True, f"Docker daemon aktif (Versiyon: {version})", res.returncode
+
+    err_msg = _public_diagnostic(res.stderr) or f"Dönüş kodu: {res.returncode}"
+    return (
+        False,
+        "Docker daemon yanıt vermiyor "
+        f"(exit={res.returncode}; {err_msg}). "
+        "Docker Desktop'ın çalıştığından emin olun.",
+        res.returncode,
+    )
+
+
+def _log_docker_info_attempt(attempt: int, ok: bool, message: str, code: Optional[int]) -> None:
+    """Sağlık denemesinin teşhisini loglar. Mesaj zaten gizli değerlerden arındırılmıştır."""
+    exit_label = "yok" if code is None else str(code)
+    outcome = "başarılı" if ok else "başarısız"
+    log = logger.info if ok else logger.warning
+    if attempt == 1:
+        log(
+            "[DOCKER_HEALTH] deneme=1 sonuç=%s exit=%s tanı=%s. "
+            "Aynı kontrol bir kez daha denenecek.",
+            outcome,
+            exit_label,
+            message,
+        )
+        return
+    log(
+        "[DOCKER_HEALTH] deneme=%s sonuç=%s exit=%s tanı=%s",
+        attempt,
+        outcome,
+        exit_label,
+        message,
+    )
 
 
 class DockerExecutionEngine(BaseExecutionEngine):
@@ -68,6 +142,9 @@ class DockerExecutionEngine(BaseExecutionEngine):
         """
         Docker CLI ve Docker daemon'ın erişilebilir olup olmadığını doğrular
         ve ayrıntılı teşhis mesajı döndürür.
+
+        Yalnızca docker info çıkış kodu 130 olduğunda aynı kontrol bir kez
+        daha çalışır. Zaman aşımı ve diğer çıkış kodları yeniden denenmez.
         """
         docker_cmd = self._get_docker_cmd()
         if not shutil.which(docker_cmd) and not os.path.isfile(docker_cmd):
@@ -79,38 +156,12 @@ class DockerExecutionEngine(BaseExecutionEngine):
             self.last_availability = result
             return result
 
-        try:
-            res = subprocess.run(
-                [docker_cmd, "info", "--format", "{{.ServerVersion}}"],
-                capture_output=True,
-                text=True,
-                timeout=10.0,
-                stdin=subprocess.DEVNULL
-            )
-            if res.returncode == 0 and len(res.stdout.strip()) > 0:
-                version = _public_diagnostic(res.stdout.strip(), limit=80)
-                result = (True, f"Docker daemon aktif (Versiyon: {version})")
-            else:
-                err_msg = _public_diagnostic(res.stderr) or f"Dönüş kodu: {res.returncode}"
-                result = (
-                    False,
-                    "Docker daemon yanıt vermiyor "
-                    f"(exit={res.returncode}; {err_msg}). "
-                    "Docker Desktop'ın çalıştığından emin olun."
-                )
-        except subprocess.TimeoutExpired:
-            result = (
-                False,
-                "Docker daemon yanıt vermedi (10.0s zaman aşımı; exception=TimeoutExpired)."
-            )
-        except Exception as exc:
-            detail = _public_diagnostic(str(exc))
-            suffix = f": {detail}" if detail else ""
-            result = (
-                False,
-                "Docker bağlantı kontrolü sırasında hata: "
-                f"exception={type(exc).__name__}{suffix}"
-            )
+        ok, message, code = _run_docker_info_probe(docker_cmd)
+        if code == _INTERRUPTED_DOCKER_INFO_EXIT:
+            _log_docker_info_attempt(1, ok, message, code)
+            ok, message, code = _run_docker_info_probe(docker_cmd)
+            _log_docker_info_attempt(2, ok, message, code)
+        result = (ok, message)
         self.last_availability = result
         return result
 
