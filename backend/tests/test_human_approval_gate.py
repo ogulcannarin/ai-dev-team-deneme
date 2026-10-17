@@ -94,6 +94,7 @@ def test_reviewer_approved_without_human_approval_stays_reviewed():
 
 
 def test_changes_requested_still_retries_when_approval_required(monkeypatch):
+    """Değişiklik talebi retry başlatır. Aynı deterministik şablon onay veya insan kapısına taşınmaz."""
     calls = {"n": 0}
 
     def fake_reviewer(*_args, **_kwargs):
@@ -111,10 +112,12 @@ def test_changes_requested_still_retries_when_approval_required(monkeypatch):
         max_retries=1,
     )
 
-    assert calls["n"] >= 2
+    assert calls["n"] == 1
     assert any(event.get("type") == "retry_triggered" for event in result["events"])
-    assert result["reviewer"]["verdict"] == ReviewerVerdict.APPROVED.value
-    assert result["status"] == TaskStatus.AWAITING_APPROVAL.value
+    assert result["status"] == TaskStatus.FAILED.value
+    assert "deterministik şablon" in (result.get("error") or "")
+    assert result["reviewer"]["verdict"] == ReviewerVerdict.CHANGES_REQUESTED.value
+    assert result["status"] != TaskStatus.AWAITING_APPROVAL.value
     assert result["status"] != TaskStatus.COMPLETED.value
 
 

@@ -234,6 +234,8 @@ class TaskResponse(BaseModel):
     tester: Optional[TesterResult] = Field(None, description="Tester Agent tarafından üretilen test koşum çıktısı")
     reviewer: Optional[ReviewerResult] = Field(None, description="Reviewer Agent tarafından üretilen kod inceleme çıktısı")
     events: List[TaskEvent] = Field(default_factory=list, description="Görevin olay günlüğü")
+    retry_count: int = Field(default=0, description="Tamamlanan Coder düzeltme denemesi. İlk üretim sayılmaz.")
+    retry_history: List[Dict[str, Any]] = Field(default_factory=list, description="Her düzeltme denemesinin coder, tester ve reviewer kaydı")
     error: Optional[str] = Field(None, description="Varsa hata mesajı")
     created_at: datetime = Field(..., description="Görevin oluşturulma zamanı (UTC)")
     updated_at: Optional[datetime] = Field(None, description="Görevin son güncellenme zamanı (UTC)")
@@ -283,6 +285,8 @@ class WorkflowRun(BaseModel):
     tester: Optional[TesterResult] = Field(None, description="Bu çalıştırmadaki Tester çıktısı")
     reviewer: Optional[ReviewerResult] = Field(None, description="Bu çalıştırmadaki Reviewer çıktısı")
     events: List[TaskEvent] = Field(default_factory=list, description="Bu çalıştırmadaki olaylar")
+    retry_count: int = Field(default=0, description="Tamamlanan Coder düzeltme denemesi. İlk üretim sayılmaz.")
+    retry_history: List[Dict[str, Any]] = Field(default_factory=list, description="Her düzeltme denemesinin coder, tester ve reviewer kaydı")
     agent_metrics: List[AgentMetric] = Field(default_factory=list, description="Agent bazlı çalışma süreleri ve durumları")
 
 

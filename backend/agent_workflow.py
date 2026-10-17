@@ -391,6 +391,20 @@ async def _llm_planner(description: str, provider: BaseLLMProvider) -> TaskPlan:
     return plan
 
 
+def _deterministic_workspace_filenames(description: str) -> List[str]:
+    """Deterministik şablonun izole alana yazacağı dosya adları. Desteklenmeyen görevde boştur."""
+    if not _is_supported_task(description):
+        return []
+    lower = description.lower()
+    if any(k in lower for k in ["rate limit", "limiter"]):
+        return ["rate_limiter.py", "README.md"]
+    if any(k in lower for k in ["auth", "jwt", "login", "token"]):
+        return ["auth.py", "README.md"]
+    if any(k in lower for k in ["hesapla", "calculator", "math", "topla", "add", "sum", "calc", "arithmetic", "aritmetik"]):
+        return ["calculator.py", "README.md"]
+    return ["models.py", "api_feature.py", "README.md"]
+
+
 def _deterministic_scope(
     description: str,
     plan: Optional[TaskPlan],
@@ -440,6 +454,12 @@ def _deterministic_scope(
         proposed_new_files.append("backend/calculator.py")
     if any(k in lower_desc for k in ["component", "modal", "dialog"]) and "src/components/Modals/CustomModal.tsx" not in all_files:
         proposed_new_files.append("src/components/Modals/CustomTaskDialog.tsx")
+
+    proposed_names = {_file_basename(path) for path in proposed_new_files}
+    for name in _deterministic_workspace_filenames(description):
+        if name not in proposed_names:
+            proposed_new_files.append(name)
+            proposed_names.add(name)
 
     out_of_scope: List[str] = [
         ".env (Hassas ortam değişkenleri ve API anahtarları korunmaktadır)",
@@ -501,6 +521,7 @@ async def _llm_coder(
     scope: Optional[TaskScope] = None,
     reviewer_feedback: Optional[Dict[str, Any]] = None,
     retry_history: Optional[List[Dict[str, Any]]] = None,
+    tester_feedback: Optional[Dict[str, Any]] = None,
     provider: Optional[BaseLLMProvider] = None
 ) -> LLMCoderResponse:
     """
@@ -537,7 +558,10 @@ async def _llm_coder(
         user_prompt_parts.append("")
 
     if reviewer_feedback:
-        user_prompt_parts.append("## Previous Reviewer Feedback & Failure Context:")
+        if _reviewer_requests_changes(reviewer_feedback):
+            user_prompt_parts.append("## Reviewer Change Request:")
+        else:
+            user_prompt_parts.append("## Reviewer Result:")
         user_prompt_parts.append(f"Verdict: {reviewer_feedback.get('verdict', 'unknown')}")
         user_prompt_parts.append(f"Summary: {reviewer_feedback.get('summary', '')}")
         findings = reviewer_feedback.get("findings", [])
@@ -549,6 +573,23 @@ async def _llm_coder(
 
     if retry_history:
         user_prompt_parts.append(f"## Retry Attempt: {len(retry_history) + 1}")
+        user_prompt_parts.append("")
+
+    if _is_tester_failure(tester_feedback):
+        user_prompt_parts.append("## Latest Tester Failure:")
+        user_prompt_parts.append(f"Status: {tester_feedback.get('status', 'failed')}")
+        user_prompt_parts.append(f"Error: {tester_feedback.get('error') or ''}")
+        user_prompt_parts.append(f"Summary: {tester_feedback.get('summary') or ''}")
+        failed_names = []
+        for item in tester_feedback.get("test_results") or []:
+            if not isinstance(item, dict) or item.get("status") == "passed":
+                continue
+            name = item.get("name") or "test"
+            detail = item.get("error") or ""
+            failed_names.append(f"- {name}: {detail}")
+        if failed_names:
+            user_prompt_parts.append("Failed tests:")
+            user_prompt_parts.extend(failed_names)
         user_prompt_parts.append("")
 
     user_prompt_parts.append(f"## Allowed Target Filenames Whitelist:\n{', '.join(sorted(ALLOWED_CODER_FILENAMES))}")
@@ -866,6 +907,58 @@ Bu izole calisma alani Coder Agent tarafindan olusturulmustur.
     return files
 
 
+def _file_basename(path: str) -> str:
+    """Çalışma alanı yolunun dosya adını döndürür."""
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _is_tester_failure(tester_feedback: Optional[Dict[str, Any]]) -> bool:
+    """Tester sonucu başarısız test veya failed durumudur. Başarılı koşu hata değildir."""
+    if not isinstance(tester_feedback, dict):
+        return False
+    if tester_feedback.get("status") == "failed":
+        return True
+    try:
+        return int(tester_feedback.get("failed") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _reviewer_requests_changes(reviewer_feedback: Optional[Dict[str, Any]]) -> bool:
+    """Reviewer kararı değişiklik talebidir."""
+    if not isinstance(reviewer_feedback, dict):
+        return False
+    verdict = reviewer_feedback.get("verdict")
+    if hasattr(verdict, "value"):
+        verdict = verdict.value
+    return verdict == ReviewerVerdict.CHANGES_REQUESTED.value
+
+
+def _coder_write_allowlist(
+    scope: Optional[TaskScope],
+    prior_created_files: Optional[List[str]],
+    description: str,
+) -> Set[str]:
+    """Scope'un önerdiği veya daha önce oluşturulan dosya adları.
+
+    Boş proposed_new_files beyaz listenin tamamını açmaz. allow_overwrite bu kümeyi genişletmez.
+    Scope nesnesi yoksa da öneri yoktur; yazılacak ad kalmaz.
+    """
+    del description
+    proposed: Set[str] = set()
+    if scope is not None:
+        for path in scope.proposed_new_files or []:
+            name = _file_basename(path)
+            if name in ALLOWED_CODER_FILENAMES:
+                proposed.add(name)
+    prior = {
+        _file_basename(path)
+        for path in (prior_created_files or [])
+        if _file_basename(path) in ALLOWED_CODER_FILENAMES
+    }
+    return prior | proposed
+
+
 def _execute_coder_in_workspace(
     task_id: str,
     description: str,
@@ -876,7 +969,9 @@ def _execute_coder_in_workspace(
     reviewer_feedback: Optional[Dict[str, Any]] = None,
     code_files: Optional[Dict[str, str]] = None,
     coder_mode: str = "deterministic",
-    summary_override: Optional[str] = None
+    summary_override: Optional[str] = None,
+    tester_feedback: Optional[Dict[str, Any]] = None,
+    prior_created_files: Optional[List[str]] = None,
 ) -> CoderResult:
     """
     Coder Agent'ı güvenli, izole bir çalışma alanında çalıştırır:
@@ -884,8 +979,11 @@ def _execute_coder_in_workspace(
     2. Görevin desteklenen şablonda olup olmadığını kontrol eder (deterministik modda).
     3. `backend/workspaces/{task_id}/` izole dizinini oluşturur.
     4. Sadece izin verilen güvenli dosya adlarını yazar.
-    5. Var olan dosyaları ezmez (allow_overwrite=True olmadığı sürece).
-    6. Üretilen kodu ASLA host üzerinde çalıştırmaz.
+    5. Scope allowlist dışına yazmaz. allow_overwrite=True bu sınırı aşamaz.
+    6. Var olan dosyaları ezmez (allow_overwrite=True olmadığı sürece).
+    7. Test hatası varken içerik aynıysa dosyayı yeniden yazmaz.
+    8. Reviewer değişiklik talebi test hatasından ayrı tutulur.
+    9. Üretilen kodu ASLA host üzerinde çalıştırmaz.
     """
     if not _validate_task_id(task_id):
         return CoderResult(
@@ -928,29 +1026,67 @@ def _execute_coder_in_workspace(
 
     os.makedirs(target_workspace, exist_ok=True)
     created_relative_paths: List[str] = []
+    allowlist = _coder_write_allowlist(scope, prior_created_files, description)
+    rewritten_count = 0
 
-    for filename, content in target_code_files.items():
-        # İzin verilen dosya adı beyaz liste kontrolü
+    for filename in target_code_files:
         if filename not in ALLOWED_CODER_FILENAMES:
             return CoderResult(
                 status="failed",
-                created_files=created_relative_paths,
+                created_files=[],
                 summary="İzin verilmeyen dosya adı yazma girişimi engellendi.",
                 limitations=[],
                 error=f"İzin verilmeyen dosya adı: {filename}"
             )
-
+        if filename not in allowlist:
+            return CoderResult(
+                status="failed",
+                created_files=[],
+                summary="Scope allowlist dışındaki dosya yazımı engellendi.",
+                limitations=["allow_overwrite Scope sınırını genişletmez."],
+                error=f"Scope dışı dosya: {filename}"
+            )
         file_path = os.path.join(target_workspace, filename)
-
-        # Path traversal kontrolü
         if not _is_path_safe(file_path, target_workspace):
             return CoderResult(
                 status="failed",
-                created_files=created_relative_paths,
+                created_files=[],
                 summary="Dosya yolu çalışma alanı sınırları dışına çıktı.",
                 limitations=[],
                 error="Path traversal ihlali."
             )
+
+    tester_failed = _is_tester_failure(tester_feedback)
+    reviewer_changes = _reviewer_requests_changes(reviewer_feedback) and not tester_failed
+    if reviewer_changes and coder_mode != "llm":
+        template_unchanged = True
+        for filename, content in target_code_files.items():
+            file_path = os.path.join(target_workspace, filename)
+            current_text = None
+            if os.path.isfile(file_path) and not os.path.islink(file_path):
+                try:
+                    with open(file_path, "r", encoding="utf-8") as existing:
+                        current_text = existing.read()
+                except OSError:
+                    current_text = None
+            if current_text != content:
+                template_unchanged = False
+                break
+        if template_unchanged:
+            return CoderResult(
+                status="failed",
+                created_files=[],
+                summary="Deterministik Coder, Reviewer değişiklik talebini mevcut şablonla karşılayamadı.",
+                limitations=[
+                    "Reviewer bulguları değerlendirildi.",
+                    "Şablon aynı içeriği ürettiği için dosya yeniden yazılmadı ve düzeltme uygulanmış sayılmadı.",
+                ],
+                error="Reviewer düzeltmesi uygulanamadı: deterministik şablon aynı içeriği üretiyor.",
+            )
+
+    for filename, content in target_code_files.items():
+        file_path = os.path.join(target_workspace, filename)
+        rel_path = f"workspaces/{task_id}/{filename}"
 
         # Dosya çakışması kontrolü: allow_overwrite False ise sessizce EZME
         if os.path.exists(file_path) and not allow_overwrite:
@@ -962,11 +1098,19 @@ def _execute_coder_in_workspace(
                 error=f"Dosya çakışması: {filename} zaten mevcut."
             )
 
-        # Güvenle yaz
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        if tester_failed and os.path.isfile(file_path) and not os.path.islink(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8") as existing:
+                    current_text = existing.read()
+            except OSError:
+                current_text = None
+            if current_text == content:
+                created_relative_paths.append(rel_path)
+                continue
 
-        rel_path = f"workspaces/{task_id}/{filename}"
+        with open(file_path, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        rewritten_count += 1
         created_relative_paths.append(rel_path)
 
     default_summary = (
@@ -986,6 +1130,10 @@ def _execute_coder_in_workspace(
             "Bu kod deterministik kural tabanlı motor ile üretilmiştir (LLM çağrısı değildir).",
             "Üretilen kod izole alanda saklanmaktadır; otomatik çalıştırılmaz."
         ]
+    if tester_failed and rewritten_count == 0:
+        limitations.append(
+            "Test hatası değerlendirildi; içerik değişmediği için dosya yeniden yazılmadı."
+        )
 
     return CoderResult(
         status="coded",
@@ -1342,6 +1490,9 @@ async def coder_node(state: AgentWorkflowState) -> AgentWorkflowState:
     events = list(state.get("events") or [])
     retry_count = state.get("retry_count", 0)
     is_retry = retry_count > 0
+    raw_tester = state.get("tester") if is_retry else None
+    tester_feedback = raw_tester if _is_tester_failure(raw_tester) else None
+    prior_created_files = list((state.get("coder") or {}).get("created_files") or []) if is_retry else None
     plan_data = state.get("plan")
     scope_data = state.get("scope")
     plan_obj = TaskPlan(**plan_data) if plan_data else None
@@ -1411,6 +1562,7 @@ async def coder_node(state: AgentWorkflowState) -> AgentWorkflowState:
                 scope=scope_obj,
                 reviewer_feedback=state.get("reviewer"),
                 retry_history=state.get("retry_history"),
+                tester_feedback=tester_feedback,
                 provider=provider
             )
 
@@ -1424,7 +1576,9 @@ async def coder_node(state: AgentWorkflowState) -> AgentWorkflowState:
                 reviewer_feedback=state.get("reviewer"),
                 code_files=file_dict,
                 coder_mode="llm",
-                summary_override=llm_coder_resp.summary
+                summary_override=llm_coder_resp.summary,
+                tester_feedback=tester_feedback,
+                prior_created_files=prior_created_files,
             )
         except Exception as exc:
             c_details = {
@@ -1457,7 +1611,9 @@ async def coder_node(state: AgentWorkflowState) -> AgentWorkflowState:
                     scope=scope_obj,
                     allow_overwrite=True,
                     reviewer_feedback=state.get("reviewer"),
-                    coder_mode="deterministic"
+                    coder_mode="deterministic",
+                    tester_feedback=tester_feedback,
+                    prior_created_files=prior_created_files,
                 )
             else:
                 err_msg = f"LLM Coder kod üretimi başarısız oldu: {str(exc)}"
@@ -1504,10 +1660,29 @@ async def coder_node(state: AgentWorkflowState) -> AgentWorkflowState:
             scope=scope_obj,
             allow_overwrite=True,
             reviewer_feedback=state.get("reviewer"),
-            coder_mode="deterministic"
+            coder_mode="deterministic",
+            tester_feedback=tester_feedback,
+            prior_created_files=prior_created_files,
         )
 
     coder_dict = coder_result.model_dump()
+    if is_retry and any("içerik değişmedi" in item for item in coder_result.limitations):
+        events.append(
+            _create_event(
+                source="CODER_AGENT",
+                event_type="coder_retry_no_change",
+                message="Test hatası değerlendirildi. İçerik aynı olduğu için çalışma alanı yeniden yazılmadı.",
+                details={
+                    "retry_count": retry_count,
+                    "tester_error": (tester_feedback or {}).get("error"),
+                    "failed_tests": [
+                        item.get("name")
+                        for item in ((tester_feedback or {}).get("test_results") or [])
+                        if isinstance(item, dict) and item.get("status") != "passed"
+                    ],
+                },
+            )
+        )
 
     if coder_result.status == "coded":
         events.append(
@@ -3406,6 +3581,51 @@ def retry_node(state: AgentWorkflowState) -> AgentWorkflowState:
     }
 
 
+def fix_exhausted_node(state: AgentWorkflowState) -> AgentWorkflowState:
+    """Test düzeltme denemeleri bittiğinde görevi güvenlik engelinden ayrı olarak blocked yapar."""
+    events = list(state.get("events") or [])
+    retry_count = state.get("retry_count", 0)
+    max_retries = state.get("max_retries", 2)
+    events.append(_create_event(
+        source="ORCHESTRATOR",
+        event_type="retry_exhausted",
+        message=f"Maksimum test düzeltme sınırına ({max_retries}) ulaşıldı. Görev blocked olarak sonlandırılıyor.",
+        details={
+            "retry_count": retry_count,
+            "max_retries": max_retries,
+            "reason": "test_retries_exhausted",
+        },
+    ))
+    return {
+        **state,
+        "status": TaskStatus.BLOCKED.value,
+        "error": "Test düzeltme denemeleri tükendi (reason=test_retries_exhausted).",
+        "events": events,
+    }
+
+
+def _route_after_tester(state: AgentWorkflowState) -> str:
+    """Tester sonucuna göre Reviewer, düzeltme veya tükenme düğümünü seçer. Sayacı artırmaz."""
+    tester_data = state.get("tester") or {}
+    tester_status = tester_data.get("status")
+    try:
+        failed = int(tester_data.get("failed") or 0)
+    except (TypeError, ValueError):
+        failed = 0
+
+    if tester_status == "blocked":
+        return "reviewer"
+    if tester_status in {"tested", "passed"} and failed == 0:
+        return "reviewer"
+    if tester_status == "failed":
+        retry_count = state.get("retry_count", 0)
+        max_retries = state.get("max_retries", 2)
+        if retry_count < max_retries:
+            return "retry"
+        return "fix_exhausted"
+    return "end"
+
+
 def _event_type(event: Any) -> Optional[str]:
     if isinstance(event, dict):
         return event.get("type")
@@ -3865,6 +4085,7 @@ def build_workflow_graph(checkpointer):
     workflow.add_node("tester", _trace_node("tester", tester_node))
     workflow.add_node("reviewer", _trace_node("reviewer", reviewer_node))
     workflow.add_node("retry", _trace_node("retry", retry_node))
+    workflow.add_node("fix_exhausted", _trace_node("fix_exhausted", fix_exhausted_node))
     workflow.add_node("human_gate", _trace_node("human_gate", human_gate_node))
     workflow.add_node("delivery", _trace_node("delivery", delivery_node))
 
@@ -3902,8 +4123,18 @@ def build_workflow_graph(checkpointer):
         }
     )
 
-    # Tester'dan Reviewer'a geç
-    workflow.add_edge("tester", "reviewer")
+    # Tester sonucuna göre Reviewer, düzeltme veya tükenme
+    workflow.add_conditional_edges(
+        "tester",
+        _route_after_tester,
+        {
+            "reviewer": "reviewer",
+            "retry": "retry",
+            "fix_exhausted": "fix_exhausted",
+            "end": END,
+        },
+    )
+    workflow.add_edge("fix_exhausted", END)
 
     # Reviewer'dan kontrollü retry, insan onayı kesintisi veya END'e geç
     workflow.add_conditional_edges(

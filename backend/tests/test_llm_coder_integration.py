@@ -181,6 +181,13 @@ def filter_emails(emails: List[str]) -> List[str]:
             task_id=task_id,
             description=desc,
             plan=plan,
+            scope=TaskScope(
+                summary="email",
+                existing_files=[],
+                proposed_new_files=["email_filter.py", "README.md"],
+                out_of_scope=[],
+                risks=[],
+            ),
             workspaces_root=tmp_workspaces,
             allow_overwrite=True,
             code_files=file_dict,
@@ -252,6 +259,13 @@ def calculate_date_difference(start_date: str, end_date: str) -> int:
         llm_result = _execute_coder_in_workspace(
             task_id=task_id,
             description=desc,
+            scope=TaskScope(
+                summary="date",
+                existing_files=[],
+                proposed_new_files=["date_utils.py"],
+                out_of_scope=[],
+                risks=[],
+            ),
             workspaces_root=tmp_workspaces,
             code_files=file_dict,
             coder_mode="llm",
