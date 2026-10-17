@@ -4,6 +4,7 @@ AI Dev Team - Docker Mount Yolları, Unicode/Boşluk Desteği, Eşzamanlı Yük 
 """
 
 import asyncio
+import logging
 import os
 import shutil
 import subprocess
@@ -470,6 +471,154 @@ def test_availability_failure_redacts_secrets(monkeypatch, caplog):
     assert "[redacted]" in engine.reason
     assert "exit=1" in engine.reason
     assert "ghp_" not in caplog.text
+
+
+def _assert_docker_info_probe(args, kwargs):
+    """Sağlık kontrolü her denemede aynı komut ve subprocess sınırlarını kullanır."""
+    assert list(args[0]) == [
+        r"C:\mock\docker.exe",
+        "info",
+        "--format",
+        "{{.ServerVersion}}",
+    ]
+    assert kwargs["capture_output"] is True
+    assert kwargs["text"] is True
+    assert kwargs["timeout"] == 10.0
+    assert kwargs["stdin"] is subprocess.DEVNULL
+
+
+def _script_docker_info(monkeypatch, scripted, calls):
+    """Gerçek daemon açmadan sağlık kontrolü yanıtlarını sırayla döndürür."""
+
+    def fake_run(*args, **kwargs):
+        _assert_docker_info_probe(args, kwargs)
+        index = calls["n"]
+        calls["n"] += 1
+        item = scripted[index]
+        if isinstance(item, BaseException):
+            raise item
+
+        class Proc:
+            returncode = item[0]
+            stdout = item[1]
+            stderr = item[2]
+
+        return Proc()
+
+    _patch_docker_cli(monkeypatch, fake_run)
+
+
+def test_exit_130_retries_once_and_accepts_second_success(monkeypatch, caplog):
+    """exit=130 tek yeniden deneme hakkıdır. İkinci başarı Docker motorunu seçer."""
+    calls = {"n": 0}
+    _script_docker_info(
+        monkeypatch,
+        [
+            (130, "", "interrupted token=ghp_thisisnotarealtoken"),
+            (0, "29.6.1\n", ""),
+        ],
+        calls,
+    )
+
+    with caplog.at_level(logging.INFO):
+        engine = get_execution_engine("docker")
+
+    assert calls["n"] == 2
+    assert isinstance(engine, DockerExecutionEngine)
+    assert engine.last_availability == (True, "Docker daemon aktif (Versiyon: 29.6.1)")
+    assert engine.get_isolation_type() == "docker"
+    assert "deneme=1" in caplog.text
+    assert "exit=130" in caplog.text
+    assert "deneme=2" in caplog.text
+    assert "sonuç=başarılı" in caplog.text
+    assert "ghp_" not in caplog.text
+    assert "[redacted]" in caplog.text
+
+
+def test_exit_130_second_failure_blocks_host_execution(monkeypatch, caplog):
+    """İkinci deneme de 130 ise unavailable kalır ve host yürütmesi açılmaz."""
+    calls = {"n": 0}
+    _script_docker_info(monkeypatch, [(130, "", ""), (130, "", "")], calls)
+
+    with caplog.at_level(logging.INFO):
+        engine = get_execution_engine("docker")
+
+    assert calls["n"] == 2
+    assert isinstance(engine, UnavailableExecutionEngine)
+    assert engine.is_available() is False
+    assert engine.get_isolation_type() == "none"
+    assert "exit=130" in engine.reason
+    assert "host üzerinde çalıştırılmadı" in engine.reason
+    assert caplog.text.count("deneme=1") == 1
+    assert caplog.text.count("deneme=2") == 1
+
+    blocked = engine.execute_sync(r"C:\unused", ["python", "-m", "unittest"])
+    assert blocked.status == "blocked"
+    assert blocked.isolation_type == "none"
+    assert calls["n"] == 2
+
+
+def test_exit_130_then_other_exit_does_not_probe_a_third_time(monkeypatch, caplog):
+    """130 sonrası farklı bir çıkış kodu kaydedilir ve üçüncü deneme yapılmaz."""
+    calls = {"n": 0}
+    _script_docker_info(
+        monkeypatch,
+        [
+            (130, "", ""),
+            (1, "", "error during connect: This error may indicate that the docker daemon is not running."),
+        ],
+        calls,
+    )
+
+    with caplog.at_level(logging.INFO):
+        engine = get_execution_engine("docker")
+
+    assert calls["n"] == 2
+    assert isinstance(engine, UnavailableExecutionEngine)
+    assert engine.get_isolation_type() == "none"
+    assert "exit=1" in engine.reason
+    assert "docker daemon is not running" in engine.reason
+    assert "deneme=1" in caplog.text
+    assert "exit=130" in caplog.text
+    assert "deneme=2" in caplog.text
+    assert "exit=1" in caplog.text
+
+
+def test_exit_130_then_timeout_does_not_probe_a_third_time(monkeypatch):
+    """130 sonrası zaman aşımı ikinci denemede kalır. Üçüncü sağlık kontrolü yoktur."""
+    calls = {"n": 0}
+    _script_docker_info(
+        monkeypatch,
+        [
+            (130, "", ""),
+            subprocess.TimeoutExpired(cmd="docker", timeout=10.0),
+        ],
+        calls,
+    )
+
+    engine = get_execution_engine("docker")
+
+    assert calls["n"] == 2
+    assert isinstance(engine, UnavailableExecutionEngine)
+    assert "10.0s zaman aşımı" in engine.reason
+    assert "exception=TimeoutExpired" in engine.reason
+    assert engine.get_isolation_type() == "none"
+
+
+def test_non_130_exit_does_not_retry(monkeypatch, caplog):
+    """130 dışındaki çıkış kodu tek denemedir ve yeniden deneme logu yazılmaz."""
+    calls = {"n": 0}
+    _script_docker_info(monkeypatch, [(2, "", "permission denied")], calls)
+
+    with caplog.at_level(logging.INFO):
+        engine = get_execution_engine("docker")
+
+    assert calls["n"] == 1
+    assert isinstance(engine, UnavailableExecutionEngine)
+    assert "exit=2" in engine.reason
+    assert "permission denied" in engine.reason
+    assert "deneme=1" not in caplog.text
+    assert engine.get_isolation_type() == "none"
 
 
 # =====================================================================
