@@ -305,65 +305,123 @@ def test_benchmark_05_reviewer_rejection_quality():
 
 def test_benchmark_06_true_retry_recovery(monkeypatch):
     """
-    Senaryo 6: 1. denemede Tester'ın hata vermesi, retry_node'un tetiklenerek snapshot alması,
-    Coder'a geri bildirim aktarılması ve 2. denemede testlerin geçerek görevin onaylanması.
+    Senaryo 6: İlk üretim hatalı bayt yazar. Retry farklı ve düzeltilmiş içerik üretir,
+    ikinci Tester başarılı olur ve görev reviewed / approved olur.
     """
+    import agent_workflow
+
     task_id = "bench_06_recovery"
+    description = "FastAPI Items CRUD REST API"
     task_repo = TaskRepository()
-    task_repo.create_task(task_id, "FastAPI Items CRUD REST API")
+    task_repo.create_task(task_id, description)
 
-    call_attempt = 0
+    generated_models = []
+    original_files = agent_workflow._generate_deterministic_code_files
 
-    class AlternatingMockEngine(MockExecutionEngine):
-        def execute_sync(self, ws, cmd, config=None):
-            nonlocal call_attempt
-            call_attempt += 1
-            if call_attempt == 1:
-                # 1. Denemede Tester Hata Verir
-                return ExecutionResult(
-                    status="failed",
-                    exit_code=1,
-                    stdout="test_01 (test.Test) ... FAIL",
-                    stderr="FAILED (failures=1)",
-                    duration_ms=45.0,
-                    isolation_type="mock",
-                    raw_output="test_01 (test.Test) ... FAIL\nFAILED (failures=1)",
-                    error="Test failure on attempt 1"
+    def scripted_code_files(generated_task_id, generated_description):
+        files = dict(original_files(generated_task_id, generated_description))
+        models = files["models.py"]
+        if not generated_models:
+            models = models + "\nBUG_MARKER = True\n"
+        generated_models.append(models)
+        files["models.py"] = models
+        return files
+
+    class ContentAwareMockEngine(MockExecutionEngine):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.observed_models = []
+
+        def is_available(self):
+            return True
+
+        def get_isolation_type(self):
+            return "mock"
+
+        def execute_sync(self, workspace_path, command, config=None):
+            del command, config
+            self.calls += 1
+            models_path = os.path.join(workspace_path, "models.py")
+            try:
+                with open(models_path, "r", encoding="utf-8") as handle:
+                    content = handle.read()
+            except OSError:
+                content = ""
+            self.observed_models.append(content)
+            if "BUG_MARKER" not in content:
+                raw_output = (
+                    "test_items (test_feature.TestItems) ... ok\n"
+                    "test_create (test_feature.TestItems) ... ok\n\n"
+                    "Ran 2 tests in 0.001s\n\nOK\n"
                 )
-            else:
-                # 2. Denemede Tester Başarılı Olur
                 return ExecutionResult(
                     status="success",
                     exit_code=0,
-                    stdout="test_01 (test.Test) ... ok\ntest_02 (test.Test) ... ok",
-                    stderr="Ran 2 tests in 0.01s\n\nOK",
+                    stdout=raw_output,
+                    stderr="",
                     duration_ms=30.0,
                     isolation_type="mock",
-                    raw_output="test_01 (test.Test) ... ok\ntest_02 (test.Test) ... ok\nRan 2 tests in 0.01s\n\nOK",
-                    error=None
+                    raw_output=raw_output,
+                    error=None,
                 )
+            raw_output = (
+                "test_items (test_feature.TestItems) ... FAIL\n\n"
+                "======================================================================\n"
+                "FAIL: test_items\n"
+                "AssertionError: BUG_MARKER\n\n"
+                "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n"
+            )
+            return ExecutionResult(
+                status="failed",
+                exit_code=1,
+                stdout=raw_output,
+                stderr="",
+                duration_ms=45.0,
+                isolation_type="mock",
+                raw_output=raw_output,
+                error="Test failure on attempt 1",
+            )
 
-    engine_inst = AlternatingMockEngine()
-    monkeypatch.setattr("agent_workflow.get_execution_engine", lambda: engine_inst)
+    engine_inst = ContentAwareMockEngine()
+    monkeypatch.setattr(agent_workflow, "_generate_deterministic_code_files", scripted_code_files)
+    monkeypatch.setattr(agent_workflow, "get_execution_engine", lambda preferred=None: engine_inst)
 
     start_time = time.perf_counter()
     result = asyncio.run(run_agent_workflow(
         task_id=task_id,
-        description="FastAPI Items CRUD REST API",
+        description=description,
         planner_mode="deterministic",
         coder_mode="deterministic",
         max_retries=2
     ))
     duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
-    # 1. Retry sayısı artmış olmalı (1)
+    assert len(generated_models) == 2
+    assert generated_models[0] != generated_models[1]
+    assert "BUG_MARKER" in generated_models[0]
+    assert "BUG_MARKER" not in generated_models[1]
+    assert engine_inst.calls == 2
+    assert "BUG_MARKER" in engine_inst.observed_models[0]
+    assert "BUG_MARKER" not in engine_inst.observed_models[1]
+    models_path = os.path.join(os.path.dirname(__file__), "..", "workspaces", task_id, "models.py")
+    with open(models_path, "r", encoding="utf-8") as handle:
+        final_models = handle.read()
+    assert final_models == generated_models[1]
+    assert "BUG_MARKER" not in final_models
+
     assert result["retry_count"] == 1
-    # 2. retry_history içinde 1. denemenin snapshot'ı korunmalı
     assert len(result["retry_history"]) == 1
     assert result["retry_history"][0]["attempt"] == 1
-    # 3. 2. denemede başarı sağlandığı için nihai durum REVIEWED / APPROVED olmalıdır
+    assert result["retry_history"][0]["tester"]["status"] == "failed"
+    tester = result["tester"]
+    assert tester["status"] in {"tested", "passed"}
+    assert tester["failed"] == 0
+    assert tester["passed"] > 0
     assert result["status"] == TaskStatus.REVIEWED.value
     assert result["reviewer"]["verdict"] == ReviewerVerdict.APPROVED.value
+    limitations = (result.get("coder") or {}).get("limitations") or []
+    assert all("içerik değişmedi" not in item for item in limitations)
 
     BENCHMARK_RESULTS["Scenario_06_Retry_Recovery"] = {
         "scenario": "Retry İyileşmesi (True Recovery)",

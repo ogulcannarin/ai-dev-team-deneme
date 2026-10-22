@@ -514,6 +514,22 @@ def test_reliability_08_retry_exhaustion_terminates_gracefully(isolated_db, monk
     monkeypatch.setattr(execution, "get_execution_engine", lambda preferred=None: AlwaysFailMockEngine())
     monkeypatch.setattr(agent_workflow, "get_execution_engine", lambda preferred=None: AlwaysFailMockEngine())
 
+    generated_attempt = {"n": 0}
+    original_files = agent_workflow._generate_deterministic_code_files
+
+    def varying_deterministic_files(generated_task_id, generated_description):
+        generated_attempt["n"] += 1
+        files = dict(original_files(generated_task_id, generated_description))
+        name = next(iter(files))
+        files[name] = files[name] + f"\n# retry-byte {generated_attempt['n']}\n"
+        return files
+
+    monkeypatch.setattr(
+        agent_workflow,
+        "_generate_deterministic_code_files",
+        varying_deterministic_files,
+    )
+
     result = asyncio.run(run_agent_workflow(
         task_id=task_id,
         description="FastAPI continuous fail test",

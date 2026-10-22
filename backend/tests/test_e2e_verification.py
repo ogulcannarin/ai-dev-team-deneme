@@ -137,6 +137,24 @@ def test_scenario_b_controlled_retry_exhaustion_on_tester_failure(monkeypatch):
     task_repo = TaskRepository()
     task_repo.create_task(task_id, "FastAPI Items CRUD REST API")
 
+    import agent_workflow
+
+    generated_attempt = {"n": 0}
+    original_files = agent_workflow._generate_deterministic_code_files
+
+    def varying_deterministic_files(generated_task_id, generated_description):
+        generated_attempt["n"] += 1
+        files = dict(original_files(generated_task_id, generated_description))
+        name = next(iter(files))
+        files[name] = files[name] + f"\n# retry-byte {generated_attempt['n']}\n"
+        return files
+
+    monkeypatch.setattr(
+        agent_workflow,
+        "_generate_deterministic_code_files",
+        varying_deterministic_files,
+    )
+
     # Tester motorunun her zaman 1 hata vermesini sağlayan Mock Engine
     class FailingTesterEngine(MockExecutionEngine):
         def execute_sync(self, ws, cmd, config=None):

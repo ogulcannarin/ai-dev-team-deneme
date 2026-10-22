@@ -981,7 +981,7 @@ def _execute_coder_in_workspace(
     4. Sadece izin verilen güvenli dosya adlarını yazar.
     5. Scope allowlist dışına yazmaz. allow_overwrite=True bu sınırı aşamaz.
     6. Var olan dosyaları ezmez (allow_overwrite=True olmadığı sürece).
-    7. Test hatası varken içerik aynıysa dosyayı yeniden yazmaz.
+    7. Test hatası varken içerik aynıysa dosyayı yeniden yazmaz. Deterministik mod bu durumda failed döner.
     8. Reviewer değişiklik talebi test hatasından ayrı tutulur.
     9. Üretilen kodu ASLA host üzerinde çalıştırmaz.
     """
@@ -1134,6 +1134,14 @@ def _execute_coder_in_workspace(
         limitations.append(
             "Test hatası değerlendirildi; içerik değişmediği için dosya yeniden yazılmadı."
         )
+        if coder_mode != "llm":
+            return CoderResult(
+                status="failed",
+                created_files=created_relative_paths,
+                summary="Deterministik Coder, test hatasını mevcut şablonla karşılayamadı.",
+                limitations=limitations,
+                error="Test düzeltmesi uygulanamadı: deterministik şablon aynı içeriği üretiyor.",
+            )
 
     return CoderResult(
         status="coded",

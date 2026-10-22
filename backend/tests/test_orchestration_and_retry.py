@@ -174,6 +174,80 @@ def test_workflow_retry_on_tester_failure(monkeypatch):
     assert all("içerik değişmedi" not in item for item in limitations)
 
 
+def test_deterministic_retry_stops_when_content_unchanged(monkeypatch):
+    """Yamalanmamış deterministik şablon aynı baytı üretince retry dürüstçe durur."""
+    task_id = "task_deterministic_unchanged_retry"
+    description = "FastAPI Items CRUD REST API"
+    task_repo = TaskRepository()
+    task_repo.create_task(task_id, description)
+
+    class AlwaysFailingTester(MockExecutionEngine):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def is_available(self):
+            return True
+
+        def get_isolation_type(self):
+            return "mock"
+
+        def execute_sync(self, workspace_path, command, config=None):
+            del workspace_path, command, config
+            self.calls += 1
+            raw_output = (
+                "test_items (test_feature.TestItems) ... FAIL\n\n"
+                "======================================================================\n"
+                "FAIL: test_items\n"
+                "AssertionError: template unchanged\n\n"
+                "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n"
+            )
+            return ExecutionResult(
+                status="failed",
+                exit_code=1,
+                stdout=raw_output,
+                stderr="",
+                duration_ms=10.0,
+                isolation_type="mock",
+                raw_output=raw_output,
+                error="1 test başarısız oldu.",
+            )
+
+    engine = AlwaysFailingTester()
+    monkeypatch.setattr(agent_workflow, "get_execution_engine", lambda preferred=None: engine)
+
+    result = asyncio.run(run_agent_workflow(
+        task_id=task_id,
+        description=description,
+        planner_mode="deterministic",
+        coder_mode="deterministic",
+        max_retries=2,
+        require_human_approval=True,
+    ))
+
+    assert engine.calls == 1
+    assert result["status"] == TaskStatus.FAILED.value
+    assert result["retry_count"] == 1
+    assert len(result["retry_history"]) == 1
+    assert result["retry_history"][0]["attempt"] == 1
+    assert result["retry_history"][0]["tester"]["status"] == "failed"
+    assert result["coder"]["status"] == "failed"
+    assert "deterministik şablon aynı içeriği üretiyor" in (result.get("error") or "")
+
+    event_types = [event.get("type") for event in result.get("events") or []]
+    assert event_types.count("tester_started") == 1
+    assert event_types.count("retry_triggered") == 1
+    assert "coder_retry_no_change" in event_types
+    assert "coder_failed" in event_types
+    assert "reviewer_completed" not in event_types
+    assert "retry_exhausted" not in event_types
+    assert "test_retries_exhausted" not in event_types
+    assert all(
+        (event.get("details") or {}).get("reason") != "test_retries_exhausted"
+        for event in result.get("events") or []
+    )
+
+
 def test_workflow_never_retries_on_security_block(monkeypatch):
     """Güvenlik ihlali veya BLOCKED durumunda asla retry yapılmamalı, akış derhal durmalıdır."""
     task_id = "task_test_no_retry_on_block"
@@ -370,7 +444,8 @@ def test_scope_allowlist_rejects_overwrite_outside_scope(tmp_path):
         },
         prior_created_files=["workspaces/task_same_content/calculator.py"],
     )
-    assert unchanged.status == "coded"
+    assert unchanged.status == "failed"
+    assert "deterministik şablon aynı içeriği üretiyor" in (unchanged.error or "")
     assert any("içerik değişmedi" in item for item in unchanged.limitations)
     assert (workspace / "calculator.py").read_text(encoding="utf-8") == "same\n"
 
