@@ -66,6 +66,19 @@ def _deserialize_json(json_str: Optional[str]) -> Optional[Any]:
         return None
 
 
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    """Eski satırlarda henüz eklenmemiş kolonu varsayılanla okur."""
+    if key not in row.keys():
+        return default
+    value = row[key]
+    return default if value is None else value
+
+
+def _retry_history_from_row(row: Any) -> List[Any]:
+    raw = _deserialize_json(_row_get(row, "retry_history_json"))
+    return raw if isinstance(raw, list) else []
+
+
 def _model_or_none(model: Any, raw: Any) -> Any:
     """Eksik veya bozuk eski JSON alanını görevi çökertmeden boş kabul eder."""
     if not isinstance(raw, dict):
@@ -269,7 +282,9 @@ class TaskRepository:
         reviewer: Optional[Any] = None,
         events: Optional[List[Any]] = None,
         error: Optional[str] = None,
-        updated_at: Optional[datetime] = None
+        updated_at: Optional[datetime] = None,
+        retry_count: Optional[int] = None,
+        retry_history: Optional[List[Any]] = None,
     ) -> Optional[TaskResponse]:
         """İş akışı sonrasında görevin durum ve agent sonuçlarını günceller."""
         now_dt = updated_at or datetime.now(timezone.utc)
@@ -281,6 +296,7 @@ class TaskRepository:
         tester_json = _serialize_json(tester)
         reviewer_json = _serialize_json(reviewer)
         events_json = _serialize_json(events)
+        history_json = _serialize_json(retry_history) if retry_history is not None else None
 
         with get_db_connection(self.db_path) as conn:
             cursor = conn.execute(
@@ -294,7 +310,9 @@ class TaskRepository:
                     tester_json = ?,
                     reviewer_json = ?,
                     events_json = ?,
-                    error = ?
+                    error = ?,
+                    retry_count = COALESCE(?, retry_count),
+                    retry_history_json = COALESCE(?, retry_history_json)
                 WHERE id = ?;
                 """,
                 (
@@ -307,6 +325,8 @@ class TaskRepository:
                     reviewer_json,
                     events_json,
                     error,
+                    retry_count,
+                    history_json,
                     task_id
                 )
             )
@@ -345,6 +365,8 @@ class TaskRepository:
             tester=_model_or_none(TesterResult, tester_raw),
             reviewer=_model_or_none(ReviewerResult, reviewer_raw),
             events=parsed_events,
+            retry_count=int(_row_get(row, "retry_count", 0) or 0),
+            retry_history=_retry_history_from_row(row),
             error=row["error"],
             created_at=_parse_datetime(row["created_at"]),
             updated_at=_parse_datetime(row["updated_at"]) if row["updated_at"] else None
@@ -423,7 +445,9 @@ class WorkflowRunRepository:
         events: Optional[List[Any]] = None,
         error: Optional[str] = None,
         completed_at: Optional[datetime] = None,
-        duration_ms: Optional[float] = None
+        duration_ms: Optional[float] = None,
+        retry_count: Optional[int] = None,
+        retry_history: Optional[List[Any]] = None,
     ) -> Optional[WorkflowRun]:
         """Çalıştırma tamamlandığında sonuçları ve metrikleri kaydeder."""
         end_dt = completed_at or datetime.now(timezone.utc)
@@ -454,6 +478,7 @@ class WorkflowRunRepository:
         reviewer_json = _serialize_json(reviewer)
         events_json = _serialize_json(parsed_events)
         metrics_json = _serialize_json(metrics)
+        history_json = _serialize_json(retry_history) if retry_history is not None else None
 
         with get_db_connection(self.db_path) as conn:
             cursor = conn.execute(
@@ -469,7 +494,9 @@ class WorkflowRunRepository:
                     tester_json = ?,
                     reviewer_json = ?,
                     events_json = ?,
-                    agent_metrics_json = ?
+                    agent_metrics_json = ?,
+                    retry_count = COALESCE(?, retry_count),
+                    retry_history_json = COALESCE(?, retry_history_json)
                 WHERE id = ?;
                 """,
                 (
@@ -484,6 +511,8 @@ class WorkflowRunRepository:
                     reviewer_json,
                     events_json,
                     metrics_json,
+                    retry_count,
+                    history_json,
                     run_id
                 )
             )
@@ -550,5 +579,7 @@ class WorkflowRunRepository:
             tester=TesterResult(**tester_raw) if tester_raw else None,
             reviewer=ReviewerResult(**reviewer_raw) if reviewer_raw else None,
             events=parsed_events,
+            retry_count=int(_row_get(row, "retry_count", 0) or 0),
+            retry_history=_retry_history_from_row(row),
             agent_metrics=parsed_metrics
         )

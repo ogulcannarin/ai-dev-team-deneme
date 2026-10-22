@@ -330,6 +330,8 @@ async def run_task(
                 reviewer = result_state.get("reviewer")
                 events = result_state.get("events", [])
                 error = result_state.get("error")
+                retry_count = int(result_state.get("retry_count") or 0)
+                retry_history = result_state.get("retry_history") or []
 
                 # 3. Çalıştırma geçmişini tamamla
                 run_repo.complete_run(
@@ -343,7 +345,9 @@ async def run_task(
                     events=events,
                     error=error,
                     completed_at=end_time,
-                    duration_ms=duration_ms
+                    duration_ms=duration_ms,
+                    retry_count=retry_count,
+                    retry_history=retry_history,
                 )
 
                 # 4. Görev tablosundaki son durumu güncelle
@@ -357,7 +361,9 @@ async def run_task(
                     reviewer=reviewer,
                     events=events,
                     error=error,
-                    updated_at=end_time
+                    updated_at=end_time,
+                    retry_count=retry_count,
+                    retry_history=retry_history,
                 )
 
                 if not updated_task:
@@ -494,6 +500,8 @@ def _persist_workflow_state(task_id: str, result_state: dict, updated_at: dateti
         events=result_state.get("events") or [],
         error=result_state.get("error"),
         updated_at=updated_at,
+        retry_count=int(result_state.get("retry_count") or 0),
+        retry_history=result_state.get("retry_history") or [],
     )
     runs = run_repo.list_runs_for_task(task_id)
     if runs:
@@ -508,6 +516,8 @@ def _persist_workflow_state(task_id: str, result_state: dict, updated_at: dateti
             events=result_state.get("events") or [],
             error=result_state.get("error"),
             completed_at=updated_at,
+            retry_count=int(result_state.get("retry_count") or 0),
+            retry_history=result_state.get("retry_history") or [],
         )
     return updated
 

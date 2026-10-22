@@ -126,17 +126,34 @@ def test_scenario_b_controlled_retry_exhaustion_on_tester_failure(monkeypatch):
     """
     Senaryo B:
     Tester sürekli başarısız olduğunda:
-    - Workflow tester başarısızlığını algılar.
-    - Reviewer CHANGES_REQUESTED verir.
-    - Retry döngüsü tetiklenir ve retry_count artar.
-    - Coder'a önceki reviewer ve tester geri bildirimleri aktarılır.
+    - Workflow tester başarısızlığını algılar ve Reviewer'ı atlar.
+    - Retry döngüsü tetiklenir; sayaç ancak retry başlayınca artar.
+    - Coder'a son tester hatası aktarılır.
     - Her deneme retry_history listesinde snapshot olarak saklanır.
-    - max_retries (2) sınırına ulaşıldığında görev FAILED durumuna geçer.
-    - Asla sonsuz döngüye girmez.
+    - max_retries (2) sonrasındaki üçüncü başarısızlıkta görev blocked olur.
+    - Gerekçe test_retries_exhausted olur; reviewer_completed yazılmaz.
     """
     task_id = "task_e2e_retry_fail_test"
     task_repo = TaskRepository()
     task_repo.create_task(task_id, "FastAPI Items CRUD REST API")
+
+    import agent_workflow
+
+    generated_attempt = {"n": 0}
+    original_files = agent_workflow._generate_deterministic_code_files
+
+    def varying_deterministic_files(generated_task_id, generated_description):
+        generated_attempt["n"] += 1
+        files = dict(original_files(generated_task_id, generated_description))
+        name = next(iter(files))
+        files[name] = files[name] + f"\n# retry-byte {generated_attempt['n']}\n"
+        return files
+
+    monkeypatch.setattr(
+        agent_workflow,
+        "_generate_deterministic_code_files",
+        varying_deterministic_files,
+    )
 
     # Tester motorunun her zaman 1 hata vermesini sağlayan Mock Engine
     class FailingTesterEngine(MockExecutionEngine):
@@ -160,8 +177,11 @@ def test_scenario_b_controlled_retry_exhaustion_on_tester_failure(monkeypatch):
         max_retries=2
     ))
 
-    # 1. Görev durumu 'failed' veya 'reviewed' (changes requested) olarak sonlanmalıdır
-    assert result["status"] in [TaskStatus.FAILED.value, TaskStatus.REVIEWED.value]
+    # 1. Deneme tükenmesi güvenlik engelinden ayrı bir blocked gerekçesidir
+    assert result["status"] == TaskStatus.BLOCKED.value
+    assert "test_retries_exhausted" in (result.get("error") or "")
+    event_types = [event.get("type") for event in result.get("events", [])]
+    assert "reviewer_completed" not in event_types
     
     # 2. Retry sayacı sınırına ulaşmalıdır
     assert result["retry_count"] == 2
@@ -183,6 +203,7 @@ def test_scenario_b_controlled_retry_exhaustion_on_tester_failure(monkeypatch):
     assert len(retry_events) == 2
     exhaust_event = next((e for e in events if e.get("type") == "retry_exhausted"), None)
     assert exhaust_event is not None
+    assert (exhaust_event.get("details") or {}).get("reason") == "test_retries_exhausted"
 
 
 # =====================================================================

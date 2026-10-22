@@ -116,3 +116,16 @@ def init_db(db_path: Optional[str] = None) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at DESC);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_runs_task_id ON workflow_runs(task_id, run_number ASC);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_runs_started_at ON workflow_runs(started_at DESC);")
+
+        _ensure_column(conn, "tasks", "retry_count", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "tasks", "retry_history_json", "TEXT")
+        _ensure_column(conn, "workflow_runs", "retry_count", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "workflow_runs", "retry_history_json", "TEXT")
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    """Var olan SQLite tablosuna eksik kolonu ekler."""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    names = {row["name"] for row in rows}
+    if column not in names:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
