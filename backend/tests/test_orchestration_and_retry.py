@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 import pytest
 from fastapi.testclient import TestClient
 
+import agent_workflow
 from database import init_db
+from execution import ExecutionResult
 from execution.mock_engine import MockExecutionEngine
 from main import app, _persist_workflow_state, get_task_repository, get_workflow_run_repository
 from repository import TaskRepository, WorkflowRunRepository
@@ -52,34 +54,124 @@ def client():
 # =====================================================================
 
 def test_workflow_retry_on_tester_failure(monkeypatch):
-    """Tester başarısız olduğunda workflow kontrollü olarak Coder'a dönmeli ve retry sayacı artmalıdır."""
+    """İlk test başarısızlığı Coder'ı farklı içerik üretmeye iter; ikinci başarı Reviewer'a ulaşır."""
     task_id = "task_test_retry_success"
+    description = "FastAPI Items CRUD REST API"
     task_repo = TaskRepository()
-    task_repo.create_task(task_id, "FastAPI Items CRUD REST API")
+    task_repo.create_task(task_id, description)
 
-    # 1. Denemede başarısız, 2. denemede başarılı mock motoru
-    call_count = 0
+    generated_models = []
 
-    class AlternatingMockEngine(MockExecutionEngine):
-        def execute_sync(self, ws, cmd, config=None):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return super().execute_sync(ws, cmd, config=config)  # Default failure or custom
-            return super().execute_sync(ws, cmd, config=config)
+    def scripted_code_files(generated_task_id, generated_description):
+        del generated_task_id, generated_description
+        if not generated_models:
+            models = "BUG_MARKER = True\n"
+        else:
+            models = "RETRY_FIX_APPLIED = True\n"
+        generated_models.append(models)
+        return {
+            "models.py": models,
+            "api_feature.py": "def list_items():\n    return []\n",
+            "README.md": "Items API usage example.\n",
+        }
 
-    # run_agent_workflow ile maksimum 2 retry ayarla
+    class ContentAwareMockEngine(MockExecutionEngine):
+        def __init__(self):
+            super().__init__()
+            self.observed_models = []
+
+        def is_available(self):
+            return True
+
+        def get_isolation_type(self):
+            return "mock"
+
+        def execute_sync(self, workspace_path, command, config=None):
+            del command, config
+            models_path = os.path.join(workspace_path, "models.py")
+            try:
+                with open(models_path, "r", encoding="utf-8") as handle:
+                    content = handle.read()
+            except OSError:
+                content = ""
+            self.observed_models.append(content)
+            if "RETRY_FIX_APPLIED" in content:
+                raw_output = "test_items (test_feature.TestItems) ... ok\n\nRan 1 test in 0.001s\n\nOK\n"
+                return ExecutionResult(
+                    status="success",
+                    exit_code=0,
+                    stdout=raw_output,
+                    stderr="",
+                    duration_ms=10.0,
+                    isolation_type="mock",
+                    raw_output=raw_output,
+                    error=None,
+                )
+            raw_output = (
+                "test_items (test_feature.TestItems) ... FAIL\n\n"
+                "======================================================================\n"
+                "FAIL: test_items\n"
+                "AssertionError: BUG_MARKER\n\n"
+                "Ran 1 test in 0.001s\n\nFAILED (failures=1)\n"
+            )
+            return ExecutionResult(
+                status="failed",
+                exit_code=1,
+                stdout=raw_output,
+                stderr="",
+                duration_ms=10.0,
+                isolation_type="mock",
+                raw_output=raw_output,
+                error="1 test başarısız oldu.",
+            )
+
+    engine = ContentAwareMockEngine()
+    monkeypatch.setattr(agent_workflow, "_generate_deterministic_code_files", scripted_code_files)
+    monkeypatch.setattr(agent_workflow, "get_execution_engine", lambda preferred=None: engine)
+
     result = asyncio.run(run_agent_workflow(
         task_id=task_id,
-        description="FastAPI Items CRUD REST API",
-        max_retries=2
+        description=description,
+        planner_mode="deterministic",
+        coder_mode="deterministic",
+        max_retries=1,
+        require_human_approval=True,
     ))
 
-    # Deterministik Coder/Tester temiz geçtiği için 0 hata ile reviewed olmalıdır
-    assert result["status"] in [TaskStatus.REVIEWED.value, TaskStatus.TESTED.value]
-    assert result.get("coder") is not None
-    assert result.get("tester") is not None
-    assert result.get("reviewer") is not None
+    assert len(generated_models) == 2
+    assert generated_models[0] != generated_models[1]
+    assert len(engine.observed_models) == 2
+    assert "BUG_MARKER" in engine.observed_models[0]
+    assert "RETRY_FIX_APPLIED" in engine.observed_models[1]
+
+    models_path = os.path.join(os.path.dirname(__file__), "..", "workspaces", task_id, "models.py")
+    with open(models_path, "r", encoding="utf-8") as handle:
+        assert "RETRY_FIX_APPLIED" in handle.read()
+
+    assert result["retry_count"] == 1
+    assert len(result["retry_history"]) == 1
+    assert result["retry_history"][0]["attempt"] == 1
+    assert result["retry_history"][0]["tester"]["status"] == "failed"
+
+    tester = result["tester"]
+    assert tester["status"] in {"tested", "passed"}
+    assert tester["failed"] == 0
+    assert tester["passed"] > 0
+    assert tester["isolation_type"] == "mock"
+    assert result["reviewer"] is not None
+
+    event_types = [event.get("type") for event in result.get("events") or []]
+    assert "retry_triggered" in event_types
+    assert "coder_retry_started" in event_types
+    assert "reviewer_started" in event_types or "reviewer_completed" in event_types
+    assert "tester_blocked" not in event_types
+    assert "test_retries_exhausted" not in event_types
+    assert all(
+        (event.get("details") or {}).get("reason") != "test_retries_exhausted"
+        for event in result.get("events") or []
+    )
+    limitations = (result.get("coder") or {}).get("limitations") or []
+    assert all("içerik değişmedi" not in item for item in limitations)
 
 
 def test_workflow_never_retries_on_security_block(monkeypatch):
